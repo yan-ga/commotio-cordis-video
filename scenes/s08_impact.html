@@ -1,0 +1,729 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>s08 impact</title>
+<script src="lib.js"></script>
+<script src="shared.js"></script>
+<script src="grid2d.js"></script>
+<script type="importmap">{"imports":{"three":"../node_modules/three/build/three.module.js","three/addons/":"../node_modules/three/examples/jsm/"}}</script>
+<script type="module">
+// Part 8, the split second. 3D: the ball lands while the ECG cursor is in the window, the camera pushes
+// into the wall, cells squash and stretch doors let positive charge in (a fake knock). 2D: two tiny rows
+// (all locked / all ready), then ONE ring of 12 big cells: the hit fires the top cell, the knock into the
+// still-locked cells on its left bounces, the wave goes the long way round, those cells unlock in time,
+// it passes through them, the start is ready again and the wave chases its own tail. Then the 3D heart
+// with spinning swirls, and why it is rare.
+import * as L3 from './lib3d.js';
+import { loadHeart, createStage as createHeartStage, beat } from './heart3d.js';
+const { THREE } = L3;
+const G = window.G2;
+const TAU = Math.PI * 2;
+
+const wt = wordAt;
+const T = {
+  hit: wt(0, 'lands') + 0.05,
+  push: cs(1), squash: wt(1, 'stretches'), doors: wt(1, 'pulls open'), doorsLabel: wt(1, 'stretch doors'),
+  pours: wt(1, 'positive'), fake: wt(1, 'A fake'),
+  c2: cs(2), lockedRow: wt(2, 'If the cells'), ignoredA: wt(2, "it's ignored"), readyRow: wt(2, "If they're"),
+  extra: wt(2, 'one extra'), dies: wt(2, 'dies'),
+  c3: cs(3), fires: wt(3, 'fires the cells'), still: wt(3, 'Some of'), stillLocked: wt(3, 'still locked'), ignored: wt(3, 'the knock is'), ignoredWord: wt(3, 'ignored.'),
+  escape: wt(3, 'escape'), around: wt(3, 'goes around'),
+  c4: cs(4), unlocked: wt(4, 'those locked'), through: wt(4, 'passes'), back: wt(4, 'arrives back'),
+  c5: cs(5), startReady: wt(5, 'has unlocked'), firesAgain: wt(5, 'fires again'), round: wt(5, 'goes round'),
+  tail: wt(5, 'A wave chasing'), reentry: wt(5, 're-entry'),
+  c6: cs(6), pacemaker: wt(6, 'pacemaker'), crash: wt(6, 'crashes'), fizz: wt(6, 'fizzles'), breaks: wt(6, 'Then the loop'), tornado: wt(6, 'Electrical'),
+  c7: cs(7), overHeart: wt(7, 'right over'), force: wt(7, 'wrong force'), window: wt(7, 'tiny window'), sport: wt(7, 'It mostly'),
+};
+
+// ================================================================ colour key (three states only)
+function stateKey(ctx, x, y, alpha) {
+  if (alpha <= 0) return;
+  const items = [['Ready', 'unlocked'], ['Locked', 'locked'], ['Firing', 'firing']];
+  const w = 290, rowH = 58, h = items.length * rowH + 24;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.fillStyle = 'rgba(5,10,30,0.66)'; roundRect(ctx, x, y, w, h, 18); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth = 2; ctx.stroke();
+  items.forEach(([label, st], k) => {
+    const cy = y + 12 + rowH * (k + 0.5);
+    if (st === 'firing') glow(ctx, x + 62, cy, 50, C.spark, 0.6);
+    G.brick(ctx, x + 62, cy, 76, 44, st, { lockScale: 1.05 });
+    text(ctx, label, x + 120, cy + 1, 32, C.text, 'left', 700);
+  });
+  ctx.restore();
+}
+function title(ctx, s, alpha, size = 50) { text(ctx, s, 80, 88, size, C.text, 'left', 700, alpha); }
+function badge(ctx, s, alpha) {
+  if (alpha <= 0) return;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.font = `700 30px ${FONT}`;
+  const w = ctx.measureText(s).width + 70;
+  ctx.fillStyle = 'rgba(5,10,30,0.7)'; roundRect(ctx, 60, 50, w, 56, 28); ctx.fill();
+  ctx.fillStyle = '#ff6b6b'; ctx.beginPath(); ctx.arc(92, 78, 9, 0, TAU); ctx.fill();
+  ctx.restore();
+  text(ctx, s, 112, 79, 30, C.text, 'left', 700, alpha);
+}
+function impactRings(ctx, x, y, r, t, t0, alpha = 1) {
+  for (let k = 0; k < 3; k++) {
+    const p = seg(t, t0 + k * 0.18, t0 + k * 0.18 + 0.9);
+    if (p <= 0 || p >= 1) continue;
+    ctx.save(); ctx.globalAlpha = alpha * (1 - p); ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 7 * (1 - p) + 2;
+    ctx.beginPath(); ctx.arc(x, y, r * (0.4 + 1.0 * easeOut(p)), 0, TAU); ctx.stroke(); ctx.restore();
+  }
+}
+// A "fake knock" dropping onto a cell from above (same look as the knocks between cells).
+function dropKnock(ctx, c, t, tLand, dur, alpha = 1) {
+  const p = seg(t, tLand - dur, tLand);
+  if (p <= 0 || alpha <= 0) return;
+  if (t < tLand) G.drawKnock(ctx, { x: c.x, y: c.y - c.h / 2 - 150 }, c, { p, after: 0, outcome: 'fires' }, { size: 18, alpha });
+  impactRings(ctx, c.x, c.y, 80, t, tLand, alpha);
+}
+
+// ================================================================ 3D: chest, cells, membrane (lib3d)
+const stage = L3.createStage({ bloom: true, dof: { aperture: 0.0014, maxblur: 0.006 } });
+const S3 = stage.scene;
+const torso = L3.createTorso();
+S3.add(torso.group);
+const heartA = await loadHeart(stage.renderer);
+heartA.group.scale.setScalar(0.42);
+torso.heartAnchor.add(heartA.group);
+const ball = L3.createCricketBall();
+const flash = L3.createImpactFlash();
+torso.group.add(ball, flash.group);
+const CONTACT = new THREE.Vector3(0.24, 0.6, 0.98);
+const BALL_FROM = new THREE.Vector3(2.9, 1.25, 5.2);
+
+const cellsG = new THREE.Group(); cellsG.position.set(100, 0, 0); S3.add(cellsG);
+const sheet = L3.createCellSheet({ cols: 4, rows: 5, seed: 4 });
+cellsG.add(sheet.group);
+
+const memG = new THREE.Group(); memG.position.set(200, 0, 0); S3.add(memG);
+const mem = L3.createMembrane({ width: 16, depth: 9, doors: [{ kind: 'stretch', x: -2.9, z: 3.7 }, { kind: 'stretch', x: 2.9, z: 3.7 }], seed: 9 });
+memG.add(mem.group);
+const ions = L3.createIons('na', 70);
+memG.add(ions.group);
+
+// Heart time for the opening: real speed, then slow motion into the hit, then frozen (one beat = 1 s).
+// At the hit the beat phase sits in the vulnerable window (ECG_BEAT.vulnStart..vulnEnd).
+const SLOW = 1.0, RATE_END = 0.06;
+const E_HIT = 2 + (ECG_BEAT.vulnStart + ECG_BEAT.vulnEnd) / 2;
+const E0 = E_HIT - (T.hit - SLOW) - (SLOW - (1 - RATE_END) * SLOW / 2);
+function heartTime(t) {
+  const a = T.hit - SLOW;
+  if (t <= a) return t + E0;
+  const d = Math.min(t, T.hit) - a;
+  return a + E0 + d - (1 - RATE_END) * d * d / (2 * SLOW);
+}
+const slowRate = t => (t <= T.hit - SLOW ? 1 : t >= T.hit ? 0 : 1 - (1 - RATE_END) * (t - (T.hit - SLOW)) / SLOW);
+
+function showOnly(name) {
+  torso.group.visible = name === 'torso';
+  cellsG.visible = name === 'cells';
+  memG.visible = name === 'mem';
+}
+function cam(pos, target, fov = 32) {
+  const tg = new THREE.Vector3(...target);
+  stage.setCamera({ pos: new THREE.Vector3(...pos), target: tg, fov });
+  stage.focusOn(tg);
+}
+const mixV = (a, b, p) => a.map((v, i) => lerp(v, b[i], p));
+
+function torsoShot(t) {
+  showOnly('torso');
+  torso.set({ glass: 1 });
+  const E = heartTime(t);
+  heartA.update({ t: E, ...beat(E % 1) });
+  // Ball: flies in during the last 0.55 s of heart time before the hit, stuck at contact afterwards.
+  const f = clamp(1 - (E_HIT - E) / 0.55);
+  ball.visible = f > 0;
+  ball.position.copy(BALL_FROM).lerp(CONTACT, f);
+  ball.rotation.set(E * 9, E * 13, 0);
+  flash.group.position.set(CONTACT.x - 0.05, CONTACT.y, 0.78);
+  // The flash is frozen just after contact, like a paused frame.
+  flash.update(t >= T.hit ? 0.12 + 0.05 * seg(t, T.hit, T.hit + 0.4) : 0);
+  // Camera: a slow drift in the opening, then the push towards the hit and through the wall.
+  const v0 = { pos: [2.6, 1.2, 6.4], target: [0.55, 0.5, 0.35] };
+  const drift = Math.min(t, T.push) * 0.05;
+  const base = { pos: [v0.pos[0] - drift * 2, v0.pos[1], v0.pos[2] - drift * 3], target: v0.target };
+  const q = L3.ease(seg(t, T.push, T.push + 1.3));
+  const near = { pos: [0.75, 0.45, 1.25], target: [0.22, 0.5, 0.25] };
+  cam(mixV(base.pos, near.pos, q), mixV(base.target, near.target, q), lerp(32, 40, q));
+}
+
+// Cells under the hit: a dent that squashes them, then a springy stretch back.
+function cellShot(t, t0) {
+  showOnly('cells');
+  const lt = t - t0;
+  // Squash peaks about 0.5 s after the blow, springs back into a stretch, and settles.
+  const I = lt < 0 ? 0 : Math.exp(-lt * 0.75) * Math.cos(Math.max(0, lt - 0.5) * 2.6) * L3.ease(clamp(lt / 0.5));
+  sheet.cells.forEach((c, i) => {
+    const d = Math.hypot(c.x * 0.55, c.y * 1.2);
+    const g = Math.exp(-d * d / 10);
+    const k = I * g;
+    sheet.setCell(i, { squash: [1 + 0.4 * k, 1 - 0.75 * k, 1 - 0.4 * k] });
+    cellShot.last = I;
+    c.mesh.position.set(c.base.x * (1 + 0.12 * k), c.base.y * (1 - 0.25 * k), c.base.z - 1.5 * k);
+  });
+  const zoom = lt * 0.12;
+  stage.setCamera({ pos: new THREE.Vector3(100 + 1.2 - zoom * 0.5, 5.0 - zoom * 0.3, 14.5 - zoom), target: new THREE.Vector3(100, 0.3, -0.4), fov: 36 });
+  stage.focusOn(new THREE.Vector3(100, -0.1, 0));
+  return I;
+}
+
+const doorWorld = d => d.group.getWorldPosition(new THREE.Vector3());
+function memShot(t) {
+  showOnly('mem');
+  const st = L3.ease(seg(t, T.doors + 0.2, T.doors + 1.3));
+  mem.update(t, { stretch: st });
+  for (const d of mem.doors) d.set({ stretch: st, open: st });
+  let n = 0;
+  const flow = seg(t, T.pours - 0.3, T.pours + 0.2);
+  mem.doors.forEach((d, k) => {
+    for (let i = 0; i < 16; i++) {
+      const p = (t - T.pours + 0.3) * 0.5 - i / 16 + k * 0.03;
+      if (flow > 0 && p > 0 && p < 1) ions.set(n++, d.path(p, i + k * 40, 'in').sub(memG.position));
+    }
+  });
+  // Charge waiting outside the cell, thinning as it pours in.
+  const cloud = L3.ionCloud(5, 26, { min: [-7, 1.7, -3], max: [7, 3.2, 3.2] }, t, 0.2);
+  cloud.forEach((v, i) => { if (i < 26 - Math.floor(10 * seg(t, T.pours, T.fake))) ions.set(n++, v); });
+  ions.hideFrom(n); ions.commit();
+  const lt = t - T.doors;
+  const tg = new THREE.Vector3(200, -0.5, 2.6);
+  stage.setCamera({ pos: new THREE.Vector3(200 + 0.5 - lt * 0.1, 2.4 - lt * 0.04, 14.5 - lt * 0.2), target: tg, fov: 34 });
+  stage.focusOn(new THREE.Vector3(200, 0, 3.7));
+}
+
+// ================================================================ 3D heart for the tornadoes (heart3d)
+const hStage = createHeartStage();
+const heartB = await loadHeart(hStage.renderer);
+hStage.scene.add(heartB.group);
+
+// ================================================================ 2D rows (cue 2)
+const ROW = { n: 5, x: 1060, w: 180, h: 112, gap: 54 };
+const rowLocked = G.rowSim({ ...ROW, y: 330, lock: 50, half: 0, init: () => ({ t: -3, L: 60, H: 0 }), start: [{ cell: 2, t: 0, from: 'top', kind: 'fake', travel: 1 }] });
+const rowReady = G.rowSim({ ...ROW, y: 650, lock: 12, half: 0, start: [{ cell: 2, t: 0, from: 'top', kind: 'fake', travel: 1 }] });
+const sA = t => (t - (T.ignoredA - 0.3)) / 0.8;
+const sB = t => (t - (T.extra - 0.6)) / 0.6;
+// No 'edge' knocks: their dots run off the ends of the chain and over the row label.
+const rowKnocks = k => k.outcome === 'fires' || k.outcome === 'travel';
+// The library fades a firing brick back to red through orange. Here a brick snaps from firing to locked
+// (as in the ring) and only the glow fades, drawn under the row from `fade`.
+const snapFire = sim => Object.assign(Object.create(sim), {
+  at: s => sim.at(s).map(c => ({ ...c, fire: c.fire > 0.5 ? 1 : 0, fade: c.fire > 0.5 ? 0 : c.fire * 2 })),
+});
+const rowReadySnap = snapFire(rowReady);
+// The ready row is all red once its last cell stops firing (a brick is yellow while fire > 0.5).
+const readyAllRed = T.extra - 0.6 + 0.6 * (Math.max(...rowReady.fires.map(f => f.t)) + 1.25);
+
+function drawRows(ctx, t, alpha) {
+  if (alpha <= 0) return;
+  title(ctx, 'At any other moment', alpha * env(t, T.c2 + 0.1, T.c3 + 0.2, 0.5));
+  // One row at a time: the locked row dims back once the ready row takes over.
+  const aA = alpha * lerp(0.35, 1, seg(t, T.lockedRow - 0.6, T.lockedRow) - 0.55 * seg(t, T.readyRow - 0.5, T.readyRow)) * seg(t, T.c2 + 0.1, T.c2 + 0.6);
+  if (aA > 0) {
+    text(ctx, 'All locked', 415, 330, 40, '#ff8a9a', 'right', 800, aA);
+    G.drawRow(ctx, rowLocked, sA(t), { alpha: aA, bars: false, knocks: () => false, words: false, stimKnockSize: 18 });
+    impactRings(ctx, rowLocked.layout.cells[2].x, 330, 70, t, T.ignoredA - 0.3, aA);
+    // Beside its own row, so it is never read as belonging to the ready row below.
+    G.tag(ctx, 'ignored', 1765, 330, { size: 36, color: '#ffc2cb', alpha: aA * seg(t, T.ignoredA - 0.2, T.ignoredA + 0.2) });
+  }
+  const aB = alpha * lerp(0.35, 1, seg(t, T.readyRow - 0.5, T.readyRow)) * seg(t, T.c2 + 0.4, T.c2 + 0.9);
+  if (aB > 0) {
+    // One label out, then the other in: the two right-aligned words would overlap in a crossfade.
+    text(ctx, 'All ready', 415, 650, 40, '#7fdcf2', 'right', 800, aB * (1 - seg(t, readyAllRed, readyAllRed + 0.2)));
+    text(ctx, 'fired, now locked', 415, 650, 40, '#ff8a9a', 'right', 800, aB * seg(t, readyAllRed + 0.2, readyAllRed + 0.45));
+    rowReadySnap.at(sB(t)).forEach((c, i) => {
+      const L = rowReady.layout.cells[i];
+      if (c.fade > 0) glow(ctx, L.x, L.y, L.w, C.spark, 0.85 * c.fade * aB);
+    });
+    G.drawRow(ctx, rowReadySnap, sB(t), { alpha: aB, bars: false, knocks: rowKnocks, words: false, stimKnockSize: 18 });
+    impactRings(ctx, rowReady.layout.cells[2].x, 650, 70, t, T.extra - 0.6, aB);
+    G.tag(ctx, 'one extra beat: harmless', 1060, 800, { size: 36, color: '#ffffff', alpha: aB * seg(t, T.dies - 0.1, T.dies + 0.3) });
+  }
+}
+
+// ================================================================ the ring (cues 3 to 6)
+// 12 big cells round an ellipse, numbered in the direction the wave will travel (clockwise from the top).
+// Cell 0 is under the hit. Cells 9, 10, 11 (top left) are still locked from the last heartbeat.
+const RING = { cx: 960, cy: 520, rx: 560, ry: 318, n: 12, w: 150, h: 100 };
+const ringAngles = (() => {
+  const N = 2000, pts = [], len = [0];
+  for (let k = 0; k <= N; k++) { const a = -Math.PI / 2 + TAU * k / N; pts.push([RING.rx * Math.cos(a), RING.ry * Math.sin(a), a]); }
+  for (let k = 1; k <= N; k++) len.push(len[k - 1] + Math.hypot(pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1]));
+  const total = len[N];
+  return Array.from({ length: RING.n }, (_, i) => { const d = total * i / RING.n; let k = 0; while (len[k] < d) k++; return pts[k][2]; });
+})();
+const ringLayout = {
+  kind: 'ring', n: RING.n, gap: 40,
+  cells: ringAngles.map((a, i) => ({ x: RING.cx + RING.rx * Math.cos(a), y: RING.cy + RING.ry * Math.sin(a), w: RING.w, h: RING.h, c: i, r: 0 })),
+  nb: Array.from({ length: RING.n }, (_, i) => [(i + RING.n - 1) % RING.n, (i + 1) % RING.n]),
+  idx: i => i,
+};
+const LOCK = 7;                 // steps a cell stays locked after it fires (the red tail is 7 cells long)
+const S_UNLOCK = 11.8;          // the start cell, fired by the blow, unlocks just before the wave gets back
+const PRE = { 9: 12.3, 10: 12.6, 11: 12.9 };   // still locked from the last beat (fired at step -5)
+const ring = G.simulate(ringLayout, {
+  lock: (i, tf) => (i === 0 && tf === 0 ? S_UNLOCK : LOCK), half: 0,
+  init: i => (PRE[i] ? { t: -5, L: PRE[i], H: 0 } : null),
+  stim: [{ t: 0, cells: [0], kind: 'fake', from: 'top', travel: 1 }],
+  until: 140,
+});
+// Scene seconds to sim steps: slow for the first lap, faster once it loops.
+// The first knocks crawl so the one into the locked cells bounces exactly as "ignored" is spoken.
+const W_HEAD = [[T.c3 - 4, -6], [T.fires, 0], [T.fires + 1.0, 0.3], [T.ignoredWord - 0.15, 1], [T.around + 0.6, 5], [T.through + 0.2, 9], [T.back - 0.4, 11],
+  [T.back + 1.5, 11.55], [T.startReady + 0.05, S_UNLOCK], [T.firesAgain - 0.4, 12], [T.tail + 0.7, 24], [T.reentry + 1.0, 36]];
+const S_C6 = 36 + (T.c6 - 0.5 - T.reentry) / 0.25;
+const wPts = ds => [...W_HEAD, [T.c6 + 0.5, S_C6 + ds], [T.c7 + 5, S_C6 + ds + (T.c7 + 4.5 - T.c6) / 0.16]];
+// The loop runs up to one lap further ahead in cue 6, so the pacemaker's beat can land on "crashes"
+// 3.1 steps after the target fired (plain red, still locked).
+const PACE_TARGET = 10;
+const PACE_WANT = T.crash - 0.07;
+const loopShift = (() => {
+  const s = G.warp(wPts(0))(PACE_WANT);
+  return Math.min(...ring.fires.filter(f => f.cell === PACE_TARGET).map(f => f.t + 3.1 - s).filter(d => d >= 0));
+})();
+const W_PTS = wPts(loopShift);
+const ringStep = G.warp(W_PTS);
+const ringTime = s => { for (let k = 1; k < W_PTS.length; k++) if (s <= W_PTS[k][1]) { const [a, sa] = W_PTS[k - 1], [b, sb] = W_PTS[k]; return a + (b - a) * (s - sa) / (sb - sa); } return W_PTS[W_PTS.length - 1][0]; };
+const lapTimes = ring.fires.filter(f => f.cell === 0 && f.t > 0).map(f => ringTime(f.t));
+// Once the loop speeds up, a 0.5 s flash would light three or four cells at once, so it is capped at
+// a little over one step and the head stays one or two cells long.
+const fireReal = ring.fires.map(f => ({ cell: f.cell, t: ringTime(f.t), len: Math.min(0.5, 1.3 * (ringTime(f.t + 1) - ringTime(f.t))) }));
+// Firing flash in real seconds, so the slow first lap and the fast loop both show one bright head.
+// The brick snaps from firing to locked (a fading blend of yellow and red would read as a fourth,
+// amber state); only the glow around it fades.
+function flashAt(i, t) {
+  let brick = 0, halo = 0;
+  for (const f of fireReal) if (f.cell === i && t >= f.t) {
+    const d = t - f.t;
+    if (d < f.len) brick = 1;
+    halo = Math.max(halo, d < 0.06 ? d / 0.06 : 1 - seg(d, f.len - 0.1, f.len + 0.5));
+  }
+  return { brick, halo };
+}
+// Ellipse point at angle a, pushed in by `inset` pixels.
+const ringPt = (a, inset = 0) => [RING.cx + (RING.rx - inset) * Math.cos(a), RING.cy + (RING.ry - inset) * Math.sin(a)];
+const angleOfStep = s => { const i = Math.floor(s), f = s - i; const a0 = ringAngles[((i % 12) + 12) % 12]; let a1 = ringAngles[(((i + 1) % 12) + 12) % 12]; if (a1 < a0) a1 += TAU; return a0 + (a1 - a0) * f; };
+
+// Bright arrow inside the ring from angle a0 to a1 (clockwise).
+function arcArrow(ctx, a0, a1, inset, o = {}) {
+  if (a1 <= a0 + 0.01 || (o.alpha ?? 1) <= 0) return;
+  ctx.save(); ctx.globalAlpha *= o.alpha ?? 1;
+  ctx.strokeStyle = o.color || '#ffffff'; ctx.fillStyle = o.color || '#ffffff';
+  ctx.lineWidth = o.width || 9; ctx.lineCap = 'round';
+  ctx.shadowColor = o.glow || 'rgba(255,255,255,0.7)'; ctx.shadowBlur = 14;
+  const N = 80, headA = 30 / (RING.rx - inset);
+  const end = Math.max(a0, a1 - headA * 0.8);
+  ctx.beginPath();
+  for (let k = 0; k <= N; k++) { const p = ringPt(a0 + (end - a0) * k / N, inset); k ? ctx.lineTo(...p) : ctx.moveTo(...p); }
+  ctx.stroke();
+  if (o.head !== false) {
+    const tip = ringPt(a1, inset), back = ringPt(a1 - 0.02, inset);
+    const ang = Math.atan2(tip[1] - back[1], tip[0] - back[0]), hd = 34;
+    ctx.beginPath(); ctx.moveTo(...tip);
+    ctx.lineTo(tip[0] - Math.cos(ang - 0.5) * hd, tip[1] - Math.sin(ang - 0.5) * hd);
+    ctx.lineTo(tip[0] - Math.cos(ang + 0.5) * hd, tip[1] - Math.sin(ang + 0.5) * hd); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawRingTrack(ctx, alpha, glowAmt) {
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = 'rgba(190,205,240,0.45)'; ctx.lineWidth = 30;
+  ctx.beginPath(); ctx.ellipse(RING.cx, RING.cy, RING.rx, RING.ry, 0, 0, TAU); ctx.stroke();
+  ctx.strokeStyle = 'rgba(15,25,60,0.85)'; ctx.lineWidth = 12;
+  ctx.beginPath(); ctx.ellipse(RING.cx, RING.cy, RING.rx, RING.ry, 0, 0, TAU); ctx.stroke();
+  if (glowAmt > 0) {
+    ctx.globalAlpha *= glowAmt;
+    ctx.shadowColor = 'rgba(160,220,255,0.95)'; ctx.shadowBlur = 40;
+    ctx.strokeStyle = 'rgba(200,235,255,0.9)'; ctx.lineWidth = 14;
+    ctx.beginPath(); ctx.ellipse(RING.cx, RING.cy, RING.rx, RING.ry, 0, 0, TAU); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawRingCells(ctx, t, s, alpha, o = {}) {
+  const L = ringLayout;
+  const sts = [];
+  for (let i = 0; i < L.n; i++) {
+    const st = ring.cellAt(i, s);
+    const fl = flashAt(i, t);
+    st.fire = fl.brick;
+    sts.push(st);
+    if (fl.halo > 0) glow(ctx, L.cells[i].x, L.cells[i].y, 150, C.spark, 0.85 * fl.halo * alpha);
+  }
+  for (let i = 0; i < L.n; i++) {
+    const c = L.cells[i];
+    G.brick(ctx, c.x, c.y, c.w, c.h, sts[i], { alpha: alpha * (o.dim ? o.dim(i) : 1), bar: o.bars ? o.bars(i) : false });
+  }
+  // Knocks: forward knocks carry the wave; only bounces off the cells locked from before are shown.
+  for (const k of ring.knocksAt(s)) {
+    const show = (k.outcome === 'fires' && !k.joined) || (k.outcome === 'ignored' && !k.tail);
+    if (!show || k.to < 0) continue;
+    G.drawKnock(ctx, L.cells[k.from], L.cells[k.to], k, { size: 14, alpha, word: false, cross: false });   // the scene draws its own, longer-lasting cross
+  }
+  return sts;
+}
+
+function xMark(ctx, x, y, alpha) {
+  if (alpha <= 0) return;
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.fillStyle = 'rgba(10,16,44,0.9)'; ctx.beginPath(); ctx.arc(x, y, 24, 0, TAU); ctx.fill();
+  ctx.strokeStyle = '#ff8a9a'; ctx.lineWidth = 7; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x - 11, y - 11); ctx.lineTo(x + 11, y + 11); ctx.moveTo(x + 11, y - 11); ctx.lineTo(x - 11, y + 11); ctx.stroke(); ctx.restore();
+}
+
+// A pacemaker beat that arrives at the ring and fizzles out against its locked tail.
+const PACE_NODE = [205, 215];
+// The beat lands on the target cell 3.0 to 3.2 steps after it fired (LOCK is 7): plain red with its
+// glow nearly gone, so the stop never reads as the beat lighting the cell, and still locked while the
+// cross shows even at the fastest loop speed. It lands on "crashes"; a second beat would need the next
+// lap (1.9 s later), after the loop has broken up.
+const PACE_HOLD = 0.45;   // seconds the cross stays up after the beat stops
+const paceLanding = (fires, want) => {
+  let best = null;
+  for (const f of fires) for (let off = 3.0; off <= 3.201; off += 0.1) {
+    const tt = ringTime(f.t + off);
+    if (!best || Math.abs(tt - want) < Math.abs(best.tt - want)) best = { tt, f };
+  }
+  return best;
+};
+const paceFires = ring.fires.filter(f => f.cell === PACE_TARGET);
+const paceBeat = paceLanding(paceFires, PACE_WANT);
+const paceHits = [paceBeat.tt];
+// The beat only sets off once the target's yellow flash (1.3 steps at most) is over, so it never
+// flies towards a firing cell and the cell is plainly red for the whole trip.
+const paceLaunch = [ringTime(paceBeat.f.t + 1.4)];
+function drawPace(ctx, t, alpha) {
+  if (alpha <= 0) return;
+  const tgt = ringLayout.cells[PACE_TARGET];
+  const pulse = paceLaunch.reduce((m, l) => Math.max(m, Math.exp(-Math.pow((t - l) / 0.12, 2))), 0);
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.setLineDash([10, 12]); ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(...PACE_NODE); ctx.lineTo(tgt.x - 20, tgt.y - 40); ctx.stroke();
+  ctx.restore();
+  glow(ctx, PACE_NODE[0], PACE_NODE[1], 70 + 40 * pulse, C.node, alpha * (0.6 + 0.4 * pulse));
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.fillStyle = '#ffd9a0'; ctx.beginPath(); ctx.arc(PACE_NODE[0], PACE_NODE[1], 20 + 6 * pulse, 0, TAU); ctx.fill(); ctx.restore();
+  text(ctx, 'pacemaker', PACE_NODE[0], PACE_NODE[1] - 62, 32, '#ffd9a0', 'center', 700, alpha);
+  // Where the beat meets the red cell: its edge facing the pacemaker.
+  const dx = PACE_NODE[0] - tgt.x, dy = PACE_NODE[1] - tgt.y, Ld = Math.hypot(dx, dy);
+  const edge = Math.min(tgt.w / 2 / Math.abs(dx / Ld), tgt.h / 2 / Math.abs(dy / Ld));
+  const P = [tgt.x + dx / Ld * edge, tgt.y + dy / Ld * edge];
+  paceHits.forEach((h, k) => {
+    const p = seg(t, paceLaunch[k], h);
+    if (p > 0 && p < 1) G.drawKnock(ctx, { x: PACE_NODE[0], y: PACE_NODE[1] }, { x: P[0], y: P[1] }, { p, after: 0, outcome: 'ignored' }, { size: 16, alpha });
+    // Stops dead: no bounce, just a red ring on the locked cell's edge, a cross and a tag.
+    const d = t - h;
+    if (d < 0 || d > PACE_HOLD + 0.15) return;
+    const ra = alpha * (1 - seg(d, 0, 0.4));
+    if (ra > 0) {
+      ctx.save(); ctx.globalAlpha *= ra; ctx.strokeStyle = '#ff8a9a'; ctx.lineWidth = 6;
+      ctx.beginPath(); ctx.arc(P[0], P[1], 18 + 34 * easeOut(seg(d, 0, 0.4)), 0, TAU); ctx.stroke(); ctx.restore();
+    }
+    xMark(ctx, P[0], P[1], alpha * env(d, 0, PACE_HOLD + 0.15, 0.1));
+  });
+}
+
+// Bridge into the ring: the spot under the hit on the heart wall, then a zoom from there into the loop.
+const BR = { in: T.c3 - 0.5, z0: T.c3 + 0.3, z1: T.fires - 0.6 };
+const bridgeK = t => Math.exp(lerp(Math.log(0.1), 0, L3.ease(seg(t, BR.z0, BR.z1))));
+function drawBridgeHeart(ctx, t) {
+  const ha = seg(t, BR.in, BR.in + 0.4) * (1 - seg(t, BR.z1 - 0.4, BR.z1));
+  if (ha <= 0) return;
+  // Light blue, not gold, so the highlighted patch is never read as cells firing.
+  heartB.update({ t, dim: 0.1, highlight: { patch: 1 }, highlightColor: '#bfe6ff', patch: { at: 'chestHit', radius: 0.12 } });
+  const n = heartB.anchorNormals.chestHit;
+  // Face the patch head on and dolly in as the ring grows, so the two zoom together.
+  hStage.orbit(Math.atan2(n.x, n.z) * 180 / Math.PI, Math.asin(n.y) * 180 / Math.PI, Math.max(0.8, 0.36 / bridgeK(t)), heartB.world('chestHit'));
+  hStage.render(t);
+  ctx.save(); ctx.globalAlpha = ha; ctx.drawImage(hStage.canvas, 0, 0); ctx.restore();
+}
+
+function drawRingScene(ctx, t, alpha, zoom = null) {
+  if (alpha <= 0) return;
+  const s = ringStep(t);
+  title(ctx, 'Inside the window', alpha * env(t, BR.z1 - 0.3, T.c4 - 0.2, 0.5));
+  ctx.save();
+  if (zoom) { ctx.translate(zoom.x, zoom.y); ctx.scale(zoom.k, zoom.k); ctx.translate(-RING.cx, -RING.cy); ctx.globalAlpha *= zoom.a; }
+  const cells = ringLayout.cells, S0 = cells[0];
+  // The loop glows once the wave is back at the start and fires it again.
+  drawRingTrack(ctx, alpha, seg(t, T.firesAgain, T.firesAgain + 0.8) * (0.75 + 0.25 * Math.sin(t * 4)));
+  // Bright arrow: the wave escaping the other way and going round (first lap), then chasing round the loop.
+  const lap1 = seg(t, T.escape - 0.4, T.escape + 0.4) * (1 - seg(t, T.back + 1.6, T.back + 2.2));
+  if (lap1 > 0 && s > 0.5) arcArrow(ctx, ringAngles[0] + 0.12, angleOfStep(Math.min(s, 11.85)) - 0.08, 150, { alpha: alpha * lap1 * 0.9 });
+  const chase = seg(t, T.round - 0.6, T.round);
+  if (chase > 0) {
+    const a1 = angleOfStep(s) - 0.05, len = TAU * 0.33;
+    ctx.save(); ctx.globalAlpha *= alpha * chase * 0.3; ctx.strokeStyle = '#ffffff'; ctx.setLineDash([10, 14]); ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.ellipse(RING.cx, RING.cy, RING.rx - 150, RING.ry - 150, 0, 0, TAU); ctx.stroke(); ctx.restore();
+    arcArrow(ctx, a1 - len, a1, 150, { alpha: alpha * chase });
+  }
+  drawRingCells(ctx, t, s, alpha, {
+    bars: i => (PRE[i] && t > T.still - 0.2 && t < T.through) || (i === 0 && t > T.back - 0.4 && t < T.firesAgain),
+  });
+  // The blow: a knock dropping onto the top cell.
+  dropKnock(ctx, S0, t, ringTime(0), ringTime(0) - BR.z1 - 0.05, alpha);
+  G.tag(ctx, 'fake knock', S0.x + 230, S0.y - 112, { size: 34, alpha: alpha * env(t, BR.z1, T.still, 0.4) });
+  // Still locked: the three cells on the left, with their timers running down.
+  const lockedBox = { x: 760, y: 470 };
+  G.tag(ctx, 'still locked', lockedBox.x, lockedBox.y, { size: 34, color: '#ff8a9a', alpha: alpha * env(t, T.stillLocked - 0.2, T.escape - 0.2, 0.4), to: [cells[10].x + 40, cells[10].y + 10] });
+  // The knock into them bounces off.
+  const bounceT = ringTime(1);
+  const xa = alpha * env(t, bounceT, T.escape + 0.3, 0.2), mx = (S0.x + cells[11].x) / 2, my = (S0.y + cells[11].y) / 2;
+  xMark(ctx, mx, my, xa);
+  G.tag(ctx, 'ignored', mx, 112, { size: 34, color: '#ffc2cb', alpha: alpha * env(t, bounceT, T.escape + 0.3, 0.3) });
+  G.tag(ctx, 'goes around them', RING.cx, RING.cy, { size: 40, alpha: alpha * env(t, T.around - 0.2, T.c4 + 0.6, 0.4) });
+  G.tag(ctx, 'the long way round', RING.cx, RING.cy + 72, { size: 34, alpha: alpha * env(t, T.escape + 0.3, T.c4 + 0.6, 0.4) });
+  // Cue 4: they unlock in time, the wave goes straight through, back to the start.
+  G.tag(ctx, 'now ready', lockedBox.x, lockedBox.y, { size: 34, color: '#7fdcf2', alpha: alpha * env(t, T.unlocked + 0.4, T.through, 0.3), to: [cells[10].x + 40, cells[10].y + 10] });
+  G.tag(ctx, 'straight through', RING.cx, RING.cy, { size: 40, alpha: alpha * env(t, T.through, T.back, 0.3) });
+  G.tag(ctx, 'back to the start', RING.cx, RING.cy, { size: 40, alpha: alpha * env(t, T.back, T.startReady - 0.3, 0.3) });
+  // Cue 5: the start is ready again, fires again, and the loop runs.
+  G.tag(ctx, 'start: ready again', S0.x, S0.y - 112, { size: 34, color: '#7fdcf2', alpha: alpha * env(t, T.startReady - 0.1, T.firesAgain - 0.2, 0.3) });
+  G.tag(ctx, 'fires again', S0.x, S0.y - 112, { size: 34, color: C.spark, alpha: alpha * env(t, T.firesAgain - 0.2, T.round + 0.2, 0.3) });
+  const lapN = lapTimes.filter(x => x <= t).length;
+  if (lapN > 0) {
+    const pop = seg(t, lapTimes[lapN - 1], lapTimes[lapN - 1] + 0.45);
+    G.lapBadge(ctx, RING.cx, RING.cy - 80, lapN, { alpha: alpha * seg(t, lapTimes[0], lapTimes[0] + 0.3), pop });
+  }
+  text(ctx, 'A wave chasing its own tail', RING.cx, RING.cy + 8, 42, C.text, 'center', 700, alpha * env(t, T.tail, T.c6 + 0.8, 0.4));
+  text(ctx, 'RE-ENTRY', RING.cx, RING.cy + 72, 58, C.spark, 'center', 800, alpha * env(t, T.reentry - 0.3, T.c6 + 0.8, 0.4));
+  // Cue 6: normal beats crash into the loop and fizzle out.
+  const paceA = alpha * env(t, T.pacemaker - 0.2, T.breaks + 0.6, 0.3);
+  drawPace(ctx, t, paceA);
+  ctx.restore();
+  // Under the pacemaker, not beside the cell: it outlasts the cross, and the cell unlocks soon after the beat stops.
+  G.tag(ctx, 'ignored', PACE_NODE[0], PACE_NODE[1] + 80, { size: 32, color: '#ffc2cb', alpha: paceA * env(t - paceHits[0], -0.12, 1.5, 0.15) });
+  // Unzoomed, so it stays put and readable while the ring shrinks into the heart.
+  G.tag(ctx, 'fizzles out', 215, 480, { size: 34, color: '#ffc2cb', alpha: alpha * env(t, T.fizz - 0.2, T.fizz + 1.45, 0.2) });
+  // Unzoomed and on top, so the ring growing through it never covers it.
+  G.tag(ctx, 'a tiny loop of heart cells', RING.cx, 640, { size: 40, alpha: alpha * env(t, BR.in + 0.5, T.still - 0.2, 0.3) });
+}
+
+// ================================================================ cue 7 panels
+const PANEL = { y: 170, w: 520, h: 400, xs: [110, 700, 1290] };
+function panelBox(ctx, x, y, w, h, alpha) {
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.fillStyle = 'rgba(5,10,30,0.6)'; roundRect(ctx, x, y, w, h, 24); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.14)'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.restore();
+}
+function chestPanel(ctx, t, x, y, w, h, alpha) {
+  if (alpha <= 0) return;
+  showOnly('torso');
+  ball.visible = false; flash.update(0);
+  torso.set({ glass: 1 });
+  heartA.update({ t, ...beat((t * 1.1) % 1) });
+  cam([0, 0.7, 6.2], [0.08, 0.5, 0], 30);
+  stage.render();
+  const sw = 820, sh = sw * h / w, sx = 960 - sw / 2, sy = 540 - sh / 2;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  roundRect(ctx, x, y, w, h, 24); ctx.clip();
+  ctx.drawImage(stage.canvas, sx, sy, sw, sh, x, y, w, h);
+  ctx.restore();
+  const hp = heartA.screen('chestHit', stage.camera);
+  const px = x + (hp.x - sx) * w / sw, py = y + (hp.y - sy) * h / sh;
+  const ra = seg(t, T.overHeart - 0.2, T.overHeart + 0.4);
+  if (ra > 0) {
+    const r = 62 + 14 * (1 - L3.ease(seg(t, T.overHeart - 0.2, T.overHeart + 0.5)));
+    ctx.save(); ctx.globalAlpha *= ra; ctx.strokeStyle = '#ff6b6b'; ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.arc(px, py, r, 0, TAU); ctx.stroke();
+    ctx.beginPath(); ctx.arc(px, py, r * 0.45, 0, TAU); ctx.stroke();
+    for (let k = 0; k < 4; k++) { const a = k * Math.PI / 2; ctx.beginPath(); ctx.moveTo(px + Math.cos(a) * r * 0.7, py + Math.sin(a) * r * 0.7); ctx.lineTo(px + Math.cos(a) * r * 1.35, py + Math.sin(a) * r * 1.35); ctx.stroke(); }
+    ctx.restore();
+  }
+}
+function gaugePanel(ctx, t, x, y, w, h, alpha) {
+  if (alpha <= 0) return;
+  const cx = x + w / 2, cy = y + h * 0.72, r = 175;
+  // The danger band is the top end of the dial, so no "too hard" side suggests a harder hit is safer.
+  const zones = [[Math.PI, Math.PI * 1.64, '#5c6b94'], [Math.PI * 1.64, TAU, '#ff4d64']];
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.lineCap = 'butt';
+  for (const [a0, a1, col] of zones) { ctx.strokeStyle = col; ctx.lineWidth = 40; ctx.beginPath(); ctx.arc(cx, cy, r, a0 + 0.01, a1 - 0.01); ctx.stroke(); }
+  ctx.restore();
+  text(ctx, 'too soft', x + 92, cy + 44, 30, C.dim, 'center', 700, alpha);
+  text(ctx, 'typical', x + w - 100, y + 56, 30, '#ff8a9a', 'center', 800, alpha);
+  text(ctx, 'ball speed', x + w - 100, y + 90, 30, '#ff8a9a', 'center', 800, alpha);
+  // Needle swings up and settles in the danger band.
+  const p = seg(t, T.force - 0.5, T.force + 0.6);
+  const settle = Math.PI * 1.82 + 0.12 * Math.sin(seg(t, T.force + 0.2, T.force + 1.6) * 9) * (1 - seg(t, T.force + 0.2, T.force + 1.6));
+  const a = lerp(Math.PI * 1.04, settle, L3.ease(p));
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 8; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.cos(a) * (r - 30), cy + Math.sin(a) * (r - 30)); ctx.stroke();
+  ctx.fillStyle = '#ffffff'; ctx.beginPath(); ctx.arc(cx, cy, 16, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+function ecgPanel(ctx, t, x, y, w, h, alpha) {
+  if (alpha <= 0) return;
+  // One still heartbeat, with the vulnerable window as a red band and the blow marked in it.
+  const ph0 = 0.05, ph1 = 0.85;
+  const span = ph1 - ph0;
+  const lo = -0.45, hi = 1.4, px = x + 30, pw = w - 60, py = y + 40, ph = h - 80;
+  const X = p => px + (p - ph0) / span * pw, Y = v => py + ph * (hi - v) / (hi - lo);
+  const wa = alpha * seg(t, T.window - 0.4, T.window + 0.2);
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.save(); ctx.globalAlpha *= 0.25 + 0.45 * wa / Math.max(alpha, 1e-3); ctx.fillStyle = '#ff4d64';
+  ctx.fillRect(X(ECG_BEAT.vulnStart - 0.012), py, X(ECG_BEAT.vulnEnd + 0.012) - X(ECG_BEAT.vulnStart - 0.012), ph); ctx.restore();
+  ctx.strokeStyle = C.ecg; ctx.lineWidth = 5; ctx.lineJoin = 'round'; ctx.shadowColor = C.ecg; ctx.shadowBlur = 12;
+  ctx.beginPath();
+  for (let k = 0; k <= 300; k++) { const p = ph0 + span * k / 300; k ? ctx.lineTo(X(p), Y(ecgValue(p))) : ctx.moveTo(X(p), Y(ecgValue(p))); }
+  ctx.stroke();
+  ctx.restore();
+  const bx = X((ECG_BEAT.vulnStart + ECG_BEAT.vulnEnd) / 2);
+  text(ctx, 'window', bx, py + 4, 30, '#ff8a9a', 'center', 800, alpha * Math.max(0.35, wa));
+  impactRings(ctx, bx, Y(ecgValue(0.49)), 30, t, T.window + 0.1, wa);
+  ctx.save(); ctx.globalAlpha *= wa; ctx.fillStyle = '#ffffff'; ctx.beginPath(); ctx.arc(bx, Y(ecgValue(0.49)), 10, 0, TAU); ctx.fill(); ctx.restore();
+}
+function sportIcons(ctx, x, y, alpha) {
+  if (alpha <= 0) return;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  // cricket ball
+  let g = ctx.createRadialGradient(x - 12, y - 12, 4, x, y, 34);
+  g.addColorStop(0, '#ff6b6b'); g.addColorStop(1, '#9c1b2c');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, 32, 0, TAU); ctx.fill();
+  ctx.strokeStyle = '#ffe9d6'; ctx.lineWidth = 3; ctx.setLineDash([5, 4]);
+  ctx.beginPath(); ctx.moveTo(x - 6, y - 31); ctx.quadraticCurveTo(x - 12, y, x - 6, y + 31); ctx.moveTo(x + 6, y - 31); ctx.quadraticCurveTo(x, y, x + 6, y + 31); ctx.stroke();
+  ctx.setLineDash([]);
+  // baseball
+  const bx = x + 100;
+  g = ctx.createRadialGradient(bx - 12, y - 12, 4, bx, y, 34); g.addColorStop(0, '#ffffff'); g.addColorStop(1, '#cfcfd6');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(bx, y, 32, 0, TAU); ctx.fill();
+  ctx.strokeStyle = '#e0404f'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(bx - 44, y, 32, -0.75, 0.75); ctx.stroke(); ctx.beginPath(); ctx.arc(bx + 44, y, 32, Math.PI - 0.75, Math.PI + 0.75); ctx.stroke();
+  // hockey puck
+  const hx = x + 200;
+  // A real puck is black, so it gets a light rim to stand out from the dark banner.
+  ctx.fillStyle = '#2a2d38'; ctx.beginPath(); ctx.ellipse(hx, y + 10, 36, 14, 0, 0, TAU); ctx.fill();
+  ctx.fillRect(hx - 36, y - 6, 72, 16);
+  ctx.strokeStyle = '#c3c9dc'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(hx - 36, y - 6); ctx.lineTo(hx - 36, y + 10); ctx.ellipse(hx, y + 10, 36, 14, 0, Math.PI, 0, true); ctx.lineTo(hx + 36, y - 6); ctx.stroke();
+  ctx.fillStyle = '#4a4f62'; ctx.beginPath(); ctx.ellipse(hx, y - 6, 36, 14, 0, 0, TAU); ctx.fill();
+  ctx.strokeStyle = '#c3c9dc'; ctx.stroke();
+  ctx.restore();
+}
+function drawRare(ctx, t, alpha) {
+  if (alpha <= 0) return;
+  title(ctx, "Why it's so rare", alpha);
+  const items = [[T.overHeart, 'right over the heart', chestPanel], [T.force, 'the wrong force', gaugePanel], [T.window, 'inside that tiny window', ecgPanel]];
+  items.forEach(([t0, label, fn], k) => {
+    const on = seg(t, t0 - 0.5, t0), a = alpha * lerp(0.3, 1, on);
+    const x = PANEL.xs[k];
+    panelBox(ctx, x, PANEL.y, PANEL.w, PANEL.h, a);
+    fn(ctx, t, x, PANEL.y, PANEL.w, PANEL.h, a);
+    stamp(ctx, x + 50, PANEL.y + PANEL.h + 70, 64, 'tick', { alpha: a * on, pop: seg(t, t0 + 0.3, t0 + 0.7) });
+    text(ctx, label, x + 96, PANEL.y + PANEL.h + 70, 34, C.text, 'left', 700, a * on);
+  });
+  const sa = alpha * seg(t, T.sport - 0.2, T.sport + 0.4);
+  if (sa > 0) {
+    ctx.save(); ctx.globalAlpha *= sa;
+    ctx.fillStyle = 'rgba(5,10,30,0.7)'; roundRect(ctx, 420, 790, 1100, 110, 55); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,230,128,0.5)'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.restore();
+    sportIcons(ctx, 500, 845, sa);
+    text(ctx, 'mostly young people playing sport', 1120, 846, 40, C.text, 'center', 700, sa);
+  }
+}
+
+// ================================================================ main
+function draw(ctx, t) {
+  // ---- cues 0 and 1: 3D
+  if (t < T.c2 + 0.4) {
+    let a3 = 1 - seg(t, T.c2 - 0.3, T.c2 + 0.3);
+    const tCells = T.push + 1.0, tMem = T.doors - 0.2;
+    if (t < tCells + 0.2) {
+      torsoShot(t);
+      stage.frame(ctx, a3);
+      // Dissolve through a soft glow into the cells.
+      const g = seg(t, tCells - 0.45, tCells + 0.2);
+      if (g > 0) { ctx.fillStyle = `rgba(255,235,225,${0.55 * Math.sin(g * Math.PI)})`; ctx.fillRect(0, 0, W, H); }
+      // ECG monitor: the cursor is inside the red window at the moment of the hit.
+      const ea = env(t, 0.3, T.push + 0.5, 0.4);
+      if (ea > 0) {
+        const E = heartTime(t);
+        // A 1.6 s sweep puts the cursor near the middle of the strip at the hit, inside the red band.
+        drawECG(ctx, 1280, 70, 580, 250, ecgValue, E, 1.6, { alpha: ea, title: 'Heartbeat', bands: [{ t0: ECG_BEAT.vulnStart - 0.015, t1: ECG_BEAT.vulnEnd + 0.015, period: 1, color: '#ff4d64', alpha: 0.45 }] });
+        text(ctx, 'vulnerable window', 1600, 352, 30, '#ff8a9a', 'center', 800, ea * seg(t, T.hit - 0.9, T.hit - 0.5));
+      }
+      badge(ctx, 'slow motion', env(t, T.hit - 0.8, T.push + 0.6, 0.3));
+    } else if (t < tMem + 0.2) {
+      cellShot(t, tCells - 0.1);
+      stage.frame(ctx, a3);
+      const g = seg(t, tCells - 0.2, tCells + 0.45);
+      if (g < 1) { ctx.fillStyle = `rgba(255,235,225,${0.55 * (1 - g)})`; ctx.fillRect(0, 0, W, H); }
+      G.tag(ctx, 'squash and stretch', W / 2, 170, { size: 44, alpha: env(t, tCells + 0.3, tMem, 0.3) });
+      const I = cellShot.last || 0, pa = env(t, tCells - 0.1, tCells + 1.6, 0.25);
+      if (pa > 0) {
+        // The blow pressing in from the front.
+        ctx.save(); ctx.globalAlpha = pa * 0.85; ctx.fillStyle = '#ffffff'; ctx.shadowColor = 'rgba(0,0,0,0.5)'; ctx.shadowBlur = 12;
+        const ay = 400 + 70 * Math.max(0, I);
+        ctx.beginPath(); ctx.moveTo(W / 2 - 34, ay - 110); ctx.lineTo(W / 2 + 34, ay - 110); ctx.lineTo(W / 2 + 34, ay - 40); ctx.lineTo(W / 2 + 70, ay - 40);
+        ctx.lineTo(W / 2, ay + 30); ctx.lineTo(W / 2 - 70, ay - 40); ctx.lineTo(W / 2 - 34, ay - 40); ctx.closePath(); ctx.fill(); ctx.restore();
+      }
+      const m = seg(t, tMem - 0.4, tMem + 0.2);
+      if (m > 0) { ctx.fillStyle = `rgba(255,235,225,${0.55 * Math.sin(m * Math.PI)})`; ctx.fillRect(0, 0, W, H); }
+    } else {
+      memShot(t);
+      stage.frame(ctx, a3);
+      const g = seg(t, tMem + 0.2, tMem + 0.7);
+      if (g < 1) { ctx.fillStyle = `rgba(255,235,225,${0.5 * (1 - g)})`; ctx.fillRect(0, 0, W, H); }
+      const la = env(t, T.doorsLabel - 0.2, T.c2 - 0.2, 0.3);
+      if (la > 0) {
+        const pts = mem.doors.map(d => stage.toScreen(doorWorld(d).add(new THREE.Vector3(0, 0.9, 0))));
+        const lx = W / 2, ly = 150;
+        ctx.save(); ctx.globalAlpha *= la; ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 3;
+        for (const p of pts) { ctx.beginPath(); ctx.moveTo(lx + Math.sign(p.x - lx) * 60, ly + 26); ctx.lineTo(p.x, p.y); ctx.stroke(); ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(p.x, p.y, 7, 0, TAU); ctx.fill(); }
+        ctx.restore();
+        G.tag(ctx, 'stretch doors', lx, ly, { size: 40, alpha: la });
+      }
+      G.tag(ctx, 'outside the cell', 210, 150, { size: 30, color: C.dim, alpha: env(t, tMem + 0.4, T.c2 - 0.2, 0.3) });
+      G.tag(ctx, 'inside the cell', 210, 820, { size: 30, color: C.dim, alpha: env(t, tMem + 0.4, T.c2 - 0.2, 0.3) });
+      G.tag(ctx, '+ positive charge pours in', W / 2, 870, { size: 38, color: C.na, alpha: env(t, T.pours, T.fake, 0.3) });
+      const fa = env(t, T.fake - 0.1, T.c2 + 0.05, 0.3);
+      if (fa > 0) {
+        glow(ctx, W / 2, 860, 380, C.na, 0.25 * fa);
+        text(ctx, 'A fake knock', W / 2, 860, 72, '#ffffff', 'center', 800, fa);
+      }
+    }
+  }
+  // ---- cue 2: two rows
+  drawBridgeHeart(ctx, t);
+  drawRows(ctx, t, env(t, T.c2 - 0.1, T.c3 - 0.2, 0.4));
+  // ---- cues 3 to 6: the ring, then the 3D heart with spinning swirls
+  const ringA = env(t, T.c3 - 0.4, T.breaks + 1.2, 0.5);
+  const keyA = env(t, T.c2 + 0.2, T.breaks + 0.3, 0.4);
+  if (t > T.breaks - 0.1 && t < T.c7 + 0.6) {
+    // Heart: start close on the wall of the bottom chambers, then pull back to show more and more swirls.
+    const lt = t - T.breaks;
+    const fib = seg(t, T.breaks + 0.2, T.breaks + 1.4);
+    heartB.update({ t, fib, quiver: 0.6 * fib, dim: 0.1 });
+    const pull = L3.ease(seg(t, T.breaks + 0.6, T.tornado + 0.4));
+    const tgt = heartB.world('lvWall');
+    // Pulled back, the heart sits right of centre so the title has room on the left.
+    const target = new THREE.Vector3(lerp(tgt.x, -0.62, pull), lerp(tgt.y, -0.05, pull), lerp(tgt.z, 0, pull));
+    hStage.orbit(lerp(10, -4, pull) + lt * 1.2, lerp(0, 5, pull), lerp(1.9, 4.9, pull), target);
+    hStage.render(t);
+    const ha = seg(t, T.breaks + 0.2, T.breaks + 0.9) * (1 - seg(t, T.c7 - 0.4, T.c7 + 0.2));
+    // Words leave before the panels arrive, so the dissolve never stacks text on text.
+    const wa = 1 - seg(t, T.c7 - 0.8, T.c7 - 0.4);
+    ctx.save(); ctx.globalAlpha = ha; ctx.drawImage(hStage.canvas, 0, 0); ctx.restore();
+    text(ctx, 'more and more', 110, 400, 40, C.text, 'left', 700, ha * wa * env(t, T.breaks + 1.6, T.c7, 0.4));
+    text(ctx, 'spinning waves', 110, 452, 40, C.text, 'left', 700, ha * wa * env(t, T.breaks + 1.6, T.c7, 0.4));
+    text(ctx, 'Electrical', 110, 560, 70, C.spark, 'left', 800, ha * wa * seg(t, T.tornado - 0.1, T.tornado + 0.4));
+    text(ctx, 'tornadoes', 110, 640, 70, C.spark, 'left', 800, ha * wa * seg(t, T.tornado - 0.1, T.tornado + 0.4));
+  }
+  if (ringA > 0) {
+    // As the loop breaks up, the ring shrinks into the heart wall where the first swirl spins.
+    // It also arrives that way: grown out of the heart wall patch (the screen centre) during the bridge.
+    const q = L3.ease(seg(t, T.breaks, T.breaks + 0.9)), e = L3.ease(seg(t, BR.z0, BR.z1));
+    const zoom = t < BR.z1 ? { x: lerp(W / 2, RING.cx, e), y: lerp(H / 2, RING.cy, e), k: bridgeK(t), a: 1 }
+      : q > 0 ? { x: RING.cx, y: RING.cy, k: 1 - 0.75 * q, a: 1 - seg(t, T.breaks, T.breaks + 0.55) } : null;
+    drawRingScene(ctx, t, ringA, zoom);
+  }
+  stateKey(ctx, 1590, 36, keyA);
+  // ---- cue 7: why it is rare
+  drawRare(ctx, t, seg(t, T.c7 - 0.2, T.c7 + 0.3));
+}
+
+window.S08 = { T, ring, lapTimes, paceHits };
+setup(draw);
+</script>

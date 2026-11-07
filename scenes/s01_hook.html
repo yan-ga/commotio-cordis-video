@@ -1,0 +1,340 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>s01 hook</title>
+<script src="lib.js"></script>
+<script src="shared.js"></script>
+<script type="importmap">{"imports":{"three":"../node_modules/three/build/three.module.js","three/addons/":"../node_modules/three/examples/jsm/"}}</script>
+<script type="module">
+// Part 1 hook (3D): three quick blows to a glass torso, nothing broken, yet the heart quivers.
+// Then the name, "not an injury but an electrical fault", and a first look at the heart's wiring.
+import * as L3 from './lib3d.js';
+import { loadHeart, beat } from './heart3d.js';
+const { THREE } = L3;
+const V = (x, y, z) => new THREE.Vector3(x, y, z);
+
+const stage = L3.createStage({ bloom: true, dof: { aperture: 0.0012, maxblur: 0.005 } });
+const S = stage.scene;
+
+const torso = L3.createTorso();
+S.add(torso.group);
+const heart = await loadHeart(stage.renderer);
+heart.group.scale.setScalar(0.42);
+torso.heartAnchor.add(heart.group);
+const HEART = V(0.14, 0.55, 0.14);          // heart centre in world space (torso stays at the origin)
+
+const ball = L3.createCricketBall(), leg = L3.createLeg(), arm = L3.createArm();
+leg.rotation.y = Math.PI / 2;               // knee and elbow lead towards -Z, into the chest
+arm.rotation.y = Math.PI / 2;
+const flash = L3.createImpactFlash('#eaf4ff');
+S.add(ball, leg, arm, flash.group);
+// In the wide shot the three blows echo as soft rings on the chest: all of them landed over the heart.
+const echoes = ['ball', 'knee', 'elbow'].map((name, i) => {
+  const f = L3.createImpactFlash('#eaf4ff');
+  f.group.scale.setScalar(0.75);
+  S.add(f.group);
+  return { f, name, i };
+});
+
+// Bones fade out (with the glass) when the heart is shown on its own.
+const boneMats = new Set();
+torso.bones.traverse(o => { if (o.material) boneMats.add(o.material); });
+function setBones(a) {
+  torso.bones.visible = a > 0.002;
+  for (const m of boneMats) {
+    const tr = a < 0.999;
+    if (m.transparent !== tr) { m.transparent = tr; m.needsUpdate = true; }
+    m.opacity = a;
+  }
+}
+
+// ---------------------------------------------------------------- timing (spoken words, from the audio)
+// Seconds after a cue starts. Offsets were measured on the synthesised audio, so they hold if cues move.
+const at = (i, dt) => cs(i) + dt;
+// Each blow gets its own shot: the object comes in, lands on its word, and the shot holds a beat before the cut.
+const HIT = { ball: at(0, 0.82), knee: at(1, 0.35), elbow: at(2, 0.45), cue2: at(4, 2.95) };
+// The elbow shot holds to the end of its sentence, so the wide shot never plays under the elbow line.
+const CUT = { knee: at(1, -0.35), elbow: at(2, -0.35), wide: wordAt(2, 'ball') + 0.6 };
+// The three impact rings replay over the heart on "A hit to the chest".
+const ECHO = wordAt(3, 'A hit');
+const T = {
+  ribs: at(3, 1.625), ribTick: at(3, 1.925), heartTick: at(3, 3.225),
+  title: at(5, 0.65), sub: at(5, 2.25), injury: at(5, 4.3), fault: at(5, 5.45),
+  fibOff: at(6, 2.475), paths: at(6, 2.825), wiringTitle: at(6, 3.875),
+};
+const BPM = 72;
+// Heart phase lags the ECG so the ventricles squeeze just after each QRS spike.
+const beatPh = t => (t * BPM) / 60 - 0.1;
+
+// Contact points on the chest wall over the heart (patient's left of the breastbone).
+// The ball sits on the ball shot's line of sight through its ring, so its ripple spreads out from under it.
+const CONTACT = {
+  ball: V(0.365, 0.64, 0.9), knee: V(0.16, 0.5, 1.06), elbow: V(0.2, 0.8, 1.0),
+};
+const SURFACE = { ball: V(0.3, 0.62, 0.72), knee: V(0.16, 0.5, 0.72), elbow: V(0.2, 0.8, 0.72) };
+
+// ---------------------------------------------------------------- camera
+const cs3 = (pos, target, fov = 32) => ({ pos: V(...pos), target: V(...target), fov });
+const SHOT = {
+  ball: [cs3([2.2, 1.25, 6.0], [0.25, 0.6, 0.45], 30), cs3([1.9, 1.15, 5.3], [0.25, 0.6, 0.45], 30)],
+  knee: [cs3([7.9, -0.6, 0.7], [0.1, -0.88, 0.45], 32), cs3([7.7, -0.62, 0.65], [0.1, -0.88, 0.45], 32)],
+  elbow: [cs3([-6.6, 1.1, 0.2], [0.1, 1.0, 0.1], 32), cs3([-6.4, 1.08, 0.18], [0.1, 1.0, 0.1], 32)],
+};
+// Wide front view after the hits, then the slow flight towards the heart, then the heart alone.
+const flight = L3.cameraPath([
+  { t: CUT.wide, pos: [0.7, 0.85, 7.4], target: [0.05, 0.5, 0], fov: 30 },
+  { t: at(3, -0.325), pos: [0.6, 0.8, 6.2], target: [0.1, 0.52, 0.05], fov: 30 },
+  { t: at(3, 1.275), pos: [0.95, 0.72, 4.3], target: [0.71, 0.6, 0.4], fov: 34 },
+  { t: at(3, 2.475), pos: [0.92, 0.72, 4.2], target: [0.71, 0.6, 0.4], fov: 34 },
+  { t: at(3, 3.275), pos: [0.8, 0.62, 3.05], target: [0.67, 0.6, 0.14], fov: 34 },
+  { t: at(3, 4.675), pos: [0.78, 0.62, 3.0], target: [0.67, 0.6, 0.14], fov: 34 },
+  { t: at(4, 0.325), pos: [1.0, 0.62, 3.05], target: [0.86, 0.6, 0.14], fov: 34 },
+  { t: at(5, -0.4), pos: [0.98, 0.62, 3.0], target: [0.86, 0.6, 0.14], fov: 34 },
+  { t: at(5, 0.7), pos: [0.14, 0.72, 3.4], target: [0.14, 0.735, 0.14], fov: 30 },
+  { t: at(6, -0.575), pos: [0.14, 0.72, 3.3], target: [0.14, 0.735, 0.14], fov: 30 },
+  { t: at(6, 2.125), pos: [0.14, 0.58, 2.75], target: [0.14, 0.6, 0.14], fov: 30 },
+], { smooth: false, drift: 0.01 });
+
+const shake = (t, t0, amp = 0.05) => {
+  if (t < t0) return V(0, 0, 0);
+  const d = t - t0, k = amp * Math.exp(-d * 9);
+  return V(Math.sin(d * 71) * k, Math.sin(d * 53 + 1) * k * 0.7, 0);
+};
+
+function camera(t) {
+  if (t < CUT.wide) {
+    const name = t < CUT.knee ? 'ball' : t < CUT.elbow ? 'knee' : 'elbow';
+    const t0 = { ball: 0, knee: CUT.knee, elbow: CUT.elbow }[name], t1 = { ball: CUT.knee, knee: CUT.elbow, elbow: CUT.wide }[name];
+    const [a, b] = SHOT[name];
+    const s = L3.pushIn(t, t0, t1, a, b);
+    s.pos.add(shake(t, HIT[name]));
+    return s;
+  }
+  if (t > at(6, -0.475)) {
+    // Slow turn around the heart while the wiring is traced.
+    const base = flight(t), yaw = THREE.MathUtils.degToRad(L3.lerp(0, 32, L3.ease(L3.seg(t, at(6, -0.475), TIMING.duration))));
+    const off = base.pos.clone().sub(base.target);
+    off.applyAxisAngle(V(0, 1, 0), yaw);
+    base.pos.copy(base.target).add(off);
+    return base;
+  }
+  const s = flight(t);
+  s.pos.add(shake(t, HIT.cue2, 0.03));
+  return s;
+}
+
+// ---------------------------------------------------------------- props
+const easeIn = p => p * p;
+// Knee and elbow ease back off the chest, then hold still for a beat before the cut.
+const settle = (t, hit) => easeOut(L3.seg(t, hit, hit + 0.8));
+// Ball: flies in on a slight arc, hits, sits on the chest for a few frames so the contact reads, then pops back off and drops.
+function ballAt(t, from, t0, tc, contact, rebound, hold = 0) {
+  if (t < t0) return null;
+  if (t < tc) {
+    const q = L3.seg(t, t0, tc);
+    return from.clone().lerp(contact, q).add(V(0, 0.2 * Math.sin(Math.PI * q), 0));
+  }
+  const d = Math.max(0, t - tc - hold);
+  return contact.clone().addScaledVector(rebound, d).add(V(0, -3.2 * d * d, 0));
+}
+
+function props(t) {
+  ball.visible = leg.visible = arm.visible = false;
+  ball.scale.setScalar(1);
+  flash.update(0);
+  for (const e of echoes) {
+    e.f.group.position.copy(SURFACE[e.name]);
+    e.f.group.quaternion.copy(stage.camera.quaternion);
+    e.f.update((t - ECHO - 0.3 * e.i) / 1.1);
+    // Ring only: the flash halo would hide the heart behind a white blob in this wide shot.
+    const [ring, halo, light] = e.f.group.children;
+    ring.material.uniforms.uAlpha.value *= 1.8;
+    halo.visible = false;
+    light.intensity = 0;
+  }
+  const hitFlash = (name, t0, boost = 1) => {
+    const p = (t - t0) / 0.55;
+    if (p > 0 && p < 1) {
+      flash.group.position.copy(SURFACE[name]); flash.group.quaternion.copy(stage.camera.quaternion); flash.update(p);
+      flash.group.children[0].material.uniforms.uAlpha.value *= boost;
+    }
+  };
+  let recoil = 0;
+  if (t < CUT.knee) {
+    const p = ballAt(t, V(3.6, 1.3, 3.0), HIT.ball - 0.7, HIT.ball, CONTACT.ball, V(2.4, 0.9, 0.9), 0.08);
+    if (p) { ball.visible = true; ball.position.copy(p); ball.rotation.set(t * 9, t * 14, 0.3); }
+    hitFlash('ball', HIT.ball, 1.8);
+    recoil = t - HIT.ball;
+  } else if (t < CUT.elbow) {
+    // The thigh swings up about the hip, so the knee arcs up and forward into the chest.
+    // Leg-local, the hip sits 3.2 behind and 0.42 above the knee, and the leg's local -X runs along world +Z.
+    leg.visible = true;
+    const q = easeIn(L3.seg(t, CUT.knee, HIT.knee)), back = settle(t, HIT.knee);
+    const th = -0.6 * (1 - q);
+    const hip = CONTACT.knee.clone().add(V(0, 0.42, 3.2 + 0.5 * (1 - q) + 0.3 * back));
+    leg.position.copy(hip).add(V(0, 3.2 * Math.sin(th) - 0.42 * Math.cos(th), -(3.2 * Math.cos(th) + 0.42 * Math.sin(th))));
+    leg.rotation.z = th;
+    hitFlash('knee', HIT.knee, 1.8);
+    recoil = t - HIT.knee;
+  } else if (t < CUT.wide) {
+    arm.visible = true;
+    const q = easeIn(L3.seg(t, CUT.elbow, HIT.elbow)), back = settle(t, HIT.elbow);
+    arm.position.copy(V(0.2, 0.95, 2.5).lerp(CONTACT.elbow, q)).add(V(0, 0, 0.27 * back));
+    arm.rotation.z = 0.1 * (1 - q);
+    hitFlash('elbow', HIT.elbow);
+    recoil = t - HIT.elbow;
+  } else if (t > HIT.cue2 - 0.45 && t < HIT.cue2 + 0.6) {
+    // The hit that stops the heart: a ball from the upper left onto the chest over the heart.
+    // The camera is close here, so the ball is scaled down and glances off sideways to keep the heart in view.
+    const p = ballAt(t, V(-2.3, 1.6, 0.85), HIT.cue2 - 0.32, HIT.cue2, V(0.3, 0.62, 0.85), V(-3.4, 1.8, 0.1));
+    if (p) { ball.visible = true; ball.scale.setScalar(0.6); ball.position.copy(p); ball.rotation.set(t * 9, t * 14, 0.3); }
+    hitFlash('ball', HIT.cue2);
+    recoil = t - HIT.cue2;
+  }
+  // The body gives a little on each blow.
+  torso.group.position.z = recoil > 0 && recoil < 0.6 ? -0.05 * Math.sin(Math.PI * recoil / 0.6) * Math.exp(-recoil * 3) : 0;
+}
+
+// ---------------------------------------------------------------- heart and torso state
+function heartState(t) {
+  const s = { t };
+  const stopped = L3.seg(t, HIT.cue2, HIT.cue2 + 0.15);
+  const b = beat(beatPh(t));
+  // Before the stop, a calm beat. After it, no squeeze, just the quiver.
+  const calm = 1 - stopped + L3.seg(t, T.fibOff, T.fibOff + 0.6) * (1 - L3.seg(t, T.paths, T.paths + 0.6));
+  s.squeezeA = b.squeezeA * calm; s.squeezeV = b.squeezeV * calm;
+  const quiv = L3.seg(t, HIT.cue2 + 0.05, HIT.cue2 + 0.5) * (1 - L3.seg(t, T.fibOff, T.fibOff + 0.5));
+  s.quiver = quiv;
+  // Scrambled electrical spirals when the voice says "electrical fault" and "scramble electricity".
+  s.fib = L3.seg(t, T.fault - 0.1, T.fault + 0.6) * (1 - L3.seg(t, T.fibOff, T.fibOff + 0.5));
+  s.dim = 0.5 * env(t, T.title - 0.6, at(6, -0.175), 0.8) + 0.4 * L3.seg(t, T.paths - 0.3, T.paths + 0.4);
+  const tp = t - T.paths;
+  if (tp > 0) { s.paths = Math.min(1.05, tp / 2.4); s.pathsGhost = 0.18; s.nodes = L3.seg(tp, 0, 0.6); }
+  return s;
+}
+
+function torsoState(t) {
+  const glass = L3.lerp(1, 0.4, L3.ease(L3.seg(t, at(3, -0.025), at(3, 1.275)))) * L3.lerp(1, 0.45, L3.ease(L3.seg(t, at(3, 2.475), at(3, 3.175)))) * (1 - L3.ease(L3.seg(t, at(5, -0.3), at(5, 0.6))));
+  torso.set({ glass });
+  // Ribs step back to a ghost once they have been ticked, so the heart is clear.
+  // Opacity reads very non-linearly on these bones, so fade on a log scale down to a faint ghost.
+  setBones(Math.exp(Math.log(0.025) * L3.ease(L3.seg(t, at(3, 2.475), at(3, 3.175)))) * (1 - L3.ease(L3.seg(t, at(5, -0.3), at(5, 0.6)))));
+  // Ribs light up top to bottom, then all glow together: every one intact.
+  const rib = L3.seg(t, T.ribs, T.ribs + 0.6);
+  const fade = 1 - L3.seg(t, at(3, 2.475), at(3, 3.175));
+  const col = new THREE.Color('#bfe3ff');
+  torso.ribs.forEach((r, i) => {
+    const k = i >> 1;
+    const g = L3.clamp(rib * 12 - k * 0.6) * fade;
+    r.material.emissive.copy(col).multiplyScalar(0.8 * Math.min(1, g));
+  });
+}
+
+// ---------------------------------------------------------------- 2D overlays
+const WORDS = [['Cricket ball', HIT.ball - 0.27, CUT.knee], ['Knee', HIT.knee - 0.1, CUT.elbow], ['Elbow', HIT.elbow - 0.12, CUT.wide]];
+function hitWords(ctx, t) {
+  for (const [w, a, b] of WORDS) {
+    if (t < a || t >= b) continue;
+    const p = L3.seg(t, a, a + 0.15);
+    ctx.save();
+    ctx.translate(140, 150); const k = 1.25 - 0.25 * easeOut(p); ctx.scale(k, k);
+    pillText(ctx, w, 0, 0, 62, C.text, 'left', p);
+    ctx.restore();
+  }
+}
+
+function ticks(ctx, t) {
+  const a = 1 - L3.seg(t, at(4, -0.875), at(4, -0.375));
+  const x = 1250;
+  stamp(ctx, x, 380, 96, 'tick', { pop: L3.seg(t, T.ribTick, T.ribTick + 0.35), label: 'No broken ribs', alpha: a });
+  stamp(ctx, x, 540, 96, 'tick', { pop: L3.seg(t, T.heartTick, T.heartTick + 0.35), label: 'Heart not damaged', alpha: a });
+}
+
+function monitor(ctx, t) {
+  const a = env(t, at(4, 0.025), at(5, -0.2), 0.6);
+  if (a <= 0) return;
+  const fn = tt => {
+    const m = L3.seg(tt, HIT.cue2, HIT.cue2 + 0.3);
+    return ecgNormal(tt, BPM) * (1 - m) + ecgVF(tt - HIT.cue2, 3) * 1.25 * m;
+  };
+  const x = 1010, y = 290, w = 840, h = 400;
+  // Scrolling, not sweeping: after the hit the squiggle enters from the right with no stale normal beats ahead of it.
+  drawECG(ctx, x, y, w, h, fn, t, 3.2, { alpha: a, lo: -0.9, hi: 1.5, mode: 'scroll' });
+  text(ctx, 'Heart monitor', x + 6, y - 36, 36, '#8fe8b0', 'left', 700, a);
+  const bad = L3.seg(t, HIT.cue2 + 0.2, HIT.cue2 + 0.5);
+  if (bad > 0) {
+    ctx.save(); ctx.globalAlpha = a * bad;
+    ctx.strokeStyle = C.locked; ctx.lineWidth = 5; roundRect(ctx, x - 3, y - 3, w + 6, h + 6, 24); ctx.stroke();
+    ctx.restore();
+  }
+  text(ctx, 'calm, steady beats', x + w / 2, y + h + 50, 36, '#8fe8b0', 'center', 700, a * (1 - bad) * L3.seg(t, at(4, 0.725), at(4, 1.225)));
+  text(ctx, 'quivering, not pumping', x + w / 2, y + h + 50, 36, C.locked, 'center', 800, a * bad);
+}
+
+function title(ctx, t) {
+  const out = 1 - L3.seg(t, at(6, -0.475), at(6, 0.125));
+  const p = L3.seg(t, T.title, T.title + 0.7);
+  if (p > 0 && out > 0) {
+    const e = easeOut(p);
+    ctx.save();
+    ctx.globalAlpha = out * Math.min(1, p * 2.5);
+    ctx.translate(960, 175); const k = 1.18 - 0.18 * e; ctx.scale(k, k);
+    ctx.font = `800 128px ${FONT}`; ctx.letterSpacing = `${L3.lerp(40, 14, e)}px`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.shadowColor = 'rgba(255,120,140,0.55)'; ctx.shadowBlur = 40 * (1 - 0.5 * e);
+    ctx.fillStyle = '#fff6f2'; ctx.fillText('COMMOTIO CORDIS', 0, 0);
+    ctx.restore();
+    // A thin rule under the title draws out from the centre.
+    const rw = 520 * easeOut(L3.seg(t, T.title + 0.3, T.title + 1.0));
+    ctx.save(); ctx.globalAlpha = out * 0.8;
+    const g = ctx.createLinearGradient(960 - rw, 0, 960 + rw, 0);
+    g.addColorStop(0, 'rgba(255,90,110,0)'); g.addColorStop(0.5, 'rgba(255,110,130,1)'); g.addColorStop(1, 'rgba(255,90,110,0)');
+    ctx.fillStyle = g; ctx.fillRect(960 - rw, 252, rw * 2, 4);
+    ctx.restore();
+  }
+  const sa = L3.seg(t, T.sub, T.sub + 0.5) * out;
+  if (sa > 0) {
+    ctx.save(); ctx.font = `600 48px ${FONT}`;
+    const lw = ctx.measureText('Latin: ').width, rw2 = ctx.measureText('commotion of the heart').width;
+    ctx.restore();
+    const x0 = 960 - (lw + rw2) / 2;
+    text(ctx, 'Latin: ', x0, 310, 48, C.dim, 'left', 600, sa);
+    text(ctx, 'commotion of the heart', x0 + lw, 310, 48, C.text, 'left', 700, sa);
+  }
+  // Placed so both stamps sit the same distance from the heart's edges.
+  stamp(ctx, 420, 640, 104, 'cross', { pop: L3.seg(t, T.injury, T.injury + 0.35), label: 'Injury', alpha: out });
+  stamp(ctx, 1345, 640, 104, 'tick', { pop: L3.seg(t, T.fault, T.fault + 0.35), label: 'Electrical fault', alpha: out });
+}
+
+function wiringTitle(ctx, t) {
+  const a = L3.seg(t, T.wiringTitle, T.wiringTitle + 0.6);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha = a;
+  ctx.translate(960, 150); const k = 1.08 - 0.08 * easeOut(a); ctx.scale(k, k);
+  ctx.font = `800 84px ${FONT}`; ctx.letterSpacing = '2px'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.shadowColor = 'rgba(255,192,64,0.5)'; ctx.shadowBlur = 30;
+  ctx.fillStyle = '#fff6e6'; ctx.fillText("The heart's wiring", 0, 0);
+  ctx.restore();
+}
+
+function draw(ctx, t) {
+  // Camera first: the impact rings face this frame's camera, so stills and cuts stay deterministic.
+  stage.setCamera(camera(t));
+  props(t);
+  torsoState(t);
+  heart.update(heartState(t));
+  stage.focusOn(t < CUT.wide ? stage.camera.position.distanceTo(t < CUT.knee ? CONTACT.ball : t < CUT.elbow ? CONTACT.knee : CONTACT.elbow) : stage.camera.position.distanceTo(HEART));
+  stage.frame(ctx);
+  // A brief white-out sells each impact.
+  for (const h of [HIT.ball, HIT.knee, HIT.elbow, HIT.cue2]) {
+    const d = t - h;
+    if (d >= 0 && d < 0.12) { ctx.fillStyle = `rgba(255,255,255,${0.2 * (1 - d / 0.12)})`; ctx.fillRect(0, 0, W, H); }
+  }
+  hitWords(ctx, t);
+  ticks(ctx, t);
+  monitor(ctx, t);
+  title(ctx, t);
+  wiringTitle(ctx, t);
+}
+
+setup(draw);
+</script>

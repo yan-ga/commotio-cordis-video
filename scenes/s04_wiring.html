@@ -1,0 +1,501 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>s04 wiring</title>
+<script src="lib.js"></script>
+<script src="shared.js"></script>
+<script src="grid2d.js"></script>
+<script type="importmap">{"imports":{"three":"../node_modules/three/build/three.module.js","three/addons/":"../node_modules/three/examples/jsm/"}}</script>
+<script type="module">
+// Part 4, the wiring. 2D: a sheet of countless cells, then one row joined by tunnels: a cell fires,
+// positive charge leaks through the tunnel and becomes a knock, and the knocks run down the row like
+// dominoes; then one spark in a grid becomes a ring-shaped wave. 3D: the real heart, the wave over the
+// top chambers, the insulating layer with the AV node as its one gateway (held for 0.1 s), the fast
+// wiring down the middle wall and round the bottom chambers, and the whole bottom firing and squeezing.
+import * as THREE from 'three';
+import { loadHeart, createStage } from './heart3d.js';
+const G = window.G2;
+const TAU = Math.PI * 2;
+
+const wt = wordAt;
+const T = {
+  billions: wt(0, 'billions'), cells: wt(0, 'Heart cells'), tunnels: wt(0, 'tiny tunnels'), fires: wt(0, 'so when one fires') + 0.35, firesW: wt(0, 'fires'),
+  charge: wt(0, 'positive charge'), think: wt(0, 'Think of it'), knock: wt(0, 'a knock'),
+  c1: cs(1), dominoes: wt(1, 'like dominoes'), spark: wt(1, 'One spark'), wave: wt(1, 'becomes a wave'),
+  c2: cs(2), sweeps: wt(2, 'sweeps'), top: wt(2, 'top chambers'), squeeze: wt(2, 'and they squeeze') + 0.3,
+  c3: cs(3), layer: wt(3, 'a layer'), blocks: wt(3, 'blocks'), gateway: wt(3, 'one gateway'), av: wt(3, 'the AV node'),
+  holds: wt(3, 'It holds'), tenth: wt(3, 'a tenth'), topUp: wt(3, 'so the top'),
+  c4: cs(4), fast: wt(4, 'fast wiring'), special: wt(4, 'special cells'), middle: wt(4, 'through the middle'), around: wt(4, 'around the bottom'),
+  c5: cs(5), whole: wt(5, 'The whole bottom'), vFires: wt(5, 'fires'), within: wt(5, 'within a tenth'), squeezes: wt(5, 'and squeezes'),
+};
+
+// ================================================================ shared 2D bits (as in s08)
+function stateKey(ctx, x, y, alpha) {
+  if (alpha <= 0) return;
+  const items = [['Ready', 'unlocked'], ['Firing', 'firing'], ['Just fired', 'fired']];
+  const w = 290, rowH = 58, h = items.length * rowH + 24;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.fillStyle = 'rgba(5,10,30,0.66)'; roundRect(ctx, x, y, w, h, 18); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth = 2; ctx.stroke();
+  items.forEach(([label, st], k) => {
+    const cy = y + 12 + rowH * (k + 0.5);
+    if (st === 'firing') glow(ctx, x + 62, cy, 50, C.spark, 0.6);
+    cellBrick(ctx, x + 62, cy, 76, 44, st);
+    text(ctx, label, x + 120, cy + 1, 32, C.text, 'left', 700);
+  });
+  ctx.restore();
+}
+function badge(ctx, s, alpha) {
+  if (alpha <= 0) return;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.font = `700 30px ${FONT}`;
+  const w = ctx.measureText(s).width + 70;
+  ctx.fillStyle = 'rgba(5,10,30,0.7)'; roundRect(ctx, 60, 50, w, 56, 28); ctx.fill();
+  ctx.fillStyle = '#ff6b6b'; ctx.beginPath(); ctx.arc(92, 78, 9, 0, TAU); ctx.fill();
+  ctx.restore();
+  text(ctx, s, 112, 79, 30, C.text, 'left', 700, alpha);
+}
+function impactRings(ctx, x, y, r, t, t0, alpha = 1) {
+  for (let k = 0; k < 3; k++) {
+    const p = seg(t, t0 + k * 0.18, t0 + k * 0.18 + 0.9);
+    if (p <= 0 || p >= 1) continue;
+    ctx.save(); ctx.globalAlpha = alpha * (1 - p); ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 7 * (1 - p) + 2;
+    ctx.beginPath(); ctx.arc(x, y, r * (0.4 + 1.0 * easeOut(p)), 0, TAU); ctx.stroke(); ctx.restore();
+  }
+}
+// Cell state from its fire time: ready before, a flash, then just fired. The lockout is not explained
+// until part 6, so a fired cell rests as plain dim grey-blue, never red. The brick snaps from firing
+// to fired (a blend would pass through a muddy amber); only the halo fades.
+function cellState(t, tf, flash = 0.5) {
+  if (tf == null || t < tf) return { st: 'unlocked', halo: 0, pulse: 0 };
+  const d = t - tf;
+  return { st: d < flash ? 'firing' : 'fired', halo: d < 0.06 ? d / 0.06 : 1 - seg(d, flash - 0.1, flash + 0.5), pulse: 0 };
+}
+// Bricks without padlocks. 'fired' has no grid2d state, so it is drawn here in the same brick style.
+const FIRED_RGB = [88, 102, 138];
+function cellBrick(ctx, x, y, w, h, st, o = {}) {
+  if (st !== 'fired') return G.brick(ctx, x, y, w, h, st, { ...o, padlock: false });
+  const alpha = o.alpha ?? 1;
+  if (alpha <= 0) return;
+  const shade = k => `rgb(${FIRED_RGB.map(c => Math.round(c + ((k > 0 ? 255 : 0) - c) * Math.abs(k))).join(',')})`;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.translate(x, y); if (o.angle) ctx.rotate(o.angle);
+  const g = ctx.createLinearGradient(0, -h / 2, 0, h / 2);
+  g.addColorStop(0, shade(0.18)); g.addColorStop(1, shade(-0.2));
+  ctx.fillStyle = g; roundRect(ctx, -w / 2, -h / 2, w, h, h * 0.28); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.1)'; roundRect(ctx, -w / 2 + 5, -h / 2 + 4, w - 10, h * 0.2, h * 0.1); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.26)'; ctx.lineWidth = 2.5;
+  roundRect(ctx, -w / 2, -h / 2, w, h, h * 0.28); ctx.stroke();
+  ctx.restore();
+}
+
+// ================================================================ cue 0 and 1: the sheet and the row
+// World units: row cells at (i * PITCH, 0); the sheet around them uses the same spacing.
+const BW = 180, BH = 112, PITCH = 234, ROWP = 170, NROW = 7;
+const SPARK_X = -PITCH * 0.95;
+const rowFire = i => (i === 0 ? T.fires : T.c1 + 0.05 + (i - 1) * 0.6);
+// Camera keys: wide sheet with the spark at the left edge, zoom onto the first two cells, then the whole row.
+const VIEW = [
+  [0, 0.26, 2600, 0], [T.cells - 0.1, 0.3, 2350, 0], [T.tunnels - 0.1, 1.55, PITCH / 2, 0],
+  [T.c1 + 0.25, 1.55, PITCH / 2, 0], [T.c1 + 1.35, 1.0, PITCH * 3, 0],
+];
+function view(t) {
+  let k = VIEW.length - 1;
+  for (let i = 1; i < VIEW.length; i++) if (t < VIEW[i][0]) { k = i; break; }
+  if (t >= VIEW[VIEW.length - 1][0]) { const v = VIEW[VIEW.length - 1]; return { k: v[1], fx: v[2], fy: v[3] }; }
+  const a = VIEW[k - 1], b = VIEW[k], p = easeIO(seg(t, a[0], b[0]));
+  // Zoom in log space so the move feels even; the focus follows the screen-space path.
+  const kk = Math.exp(lerp(Math.log(a[1]), Math.log(b[1]), p));
+  const w = (1 / kk - 1 / a[1]) / (1 / b[1] - 1 / a[1] || 1);
+  const q = isFinite(w) && a[1] !== b[1] ? clamp(w) : p;
+  return { k: kk, fx: lerp(a[2], b[2], q), fy: lerp(a[3], b[3], q) };
+}
+const toScr = (v, x, y) => [960 + v.k * (x - v.fx), 520 + v.k * (y - v.fy)];
+
+function drawTunnel(ctx, x0, x1, y, h, alpha) {
+  if (alpha <= 0) return;
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.lineCap = 'round';
+  ctx.strokeStyle = 'rgba(190,205,240,0.55)'; ctx.lineWidth = h * 0.26;
+  ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
+  ctx.strokeStyle = 'rgba(15,25,60,0.85)'; ctx.lineWidth = h * 0.11;
+  ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
+  ctx.restore();
+}
+
+function drawSheet(ctx, t, alpha) {
+  if (alpha <= 0) return;
+  const v = view(t);
+  // The rest of the sheet fades as the camera closes in on one row.
+  const other = alpha * (1 - seg(t, T.cells + 0.3, T.tunnels - 0.2));
+  ctx.save();
+  ctx.translate(960, 520); ctx.scale(v.k, v.k); ctx.translate(-v.fx, -v.fy);
+  if (other > 0) {
+    // Soft edge on the right: the sheet carries on out of frame. Top and bottom fade right out, so
+    // nothing reaches the caption band.
+    const fade = (sx, sy) => (0.35 + 0.65 * clamp((1880 - sx) / 500)) * clamp((sy + 40) / 220) * clamp((920 - sy) / 220);
+    for (let r = -15; r <= 15; r++) for (let c = 0; c <= 36; c++) {
+      if (r === 0 && c < NROW) continue;
+      const x = c * PITCH + (r & 1 ? PITCH / 2 : 0), y = r * ROWP;
+      const [sx, sy] = toScr(v, x, y);
+      if (sx < -150 || sx > 2070 || sy < -100 || sy > 920) continue;
+      const a = other * fade(sx, sy);
+      // Every cell is joined to the next by a tunnel, so the sheet reads as connected tissue.
+      if (!(r === 0 && c < NROW - 1)) drawTunnel(ctx, x + BW / 2 - 4, x + PITCH - BW / 2 + 4, y, BH, a);
+      cellBrick(ctx, x, y, BW, BH, 'unlocked', { alpha: a });
+    }
+  }
+  // Row tunnels (always there, picked out when the voice names them).
+  const tunHi = env(t, T.tunnels - 0.1, T.fires + 0.2, 0.3);
+  // While the story is about one cell and its neighbour, the rest of the row steps back.
+  const back = 1 - 0.6 * env(t, T.tunnels - 0.4, T.c1 + 1.0, 0.5);
+  const rowA = i => alpha * (i < 2 ? 1 : back);
+  for (let i = 0; i < NROW - 1; i++) {
+    const x0 = i * PITCH + BW / 2 - 4, x1 = (i + 1) * PITCH - BW / 2 + 4;
+    drawTunnel(ctx, x0, x1, 0, BH, rowA(i + 1));
+    if (tunHi > 0 && i === 0) {
+      ctx.save(); ctx.globalAlpha *= alpha * tunHi; ctx.strokeStyle = 'rgba(160,220,255,0.9)'; ctx.lineWidth = 5; ctx.shadowColor = 'rgba(160,220,255,0.9)'; ctx.shadowBlur = 18;
+      roundRect(ctx, x0 - 4, -BH * 0.18, x1 - x0 + 8, BH * 0.36, BH * 0.18); ctx.stroke(); ctx.restore();
+    }
+  }
+  // Row cells: halo first, then bricks that tip like dominoes as they fire.
+  const sts = [];
+  for (let i = 0; i < NROW; i++) {
+    const s = cellState(t, rowFire(i), i === 0 ? 1.1 : 0.5);
+    sts.push(s);
+    if (s.halo > 0) glow(ctx, i * PITCH, 0, 190, C.spark, 0.85 * s.halo * alpha);
+  }
+  for (let i = 0; i < NROW; i++) {
+    const d = t - rowFire(i);
+    const tip = i > 0 && d > 0 ? 0.16 * Math.sin(Math.PI * clamp(d / 0.45)) : 0;
+    // The first knocked cell gives a little jolt when the knock lands.
+    const jolt = i === 1 ? 7 * Math.sin(clamp((t - T.knock) / 0.35) * Math.PI * 3) * (1 - clamp((t - T.knock) / 0.35)) : 0;
+    cellBrick(ctx, i * PITCH + jolt, 0, BW, BH, sts[i].st, { alpha: rowA(i), angle: tip });
+  }
+  // The spark from the pacemaker, waiting at the edge of the sheet, then jumping into the first cell.
+  const sp = seg(t, T.fires - 0.45, T.fires);
+  const spA = alpha * (1 - seg(t, T.fires, T.fires + 0.15));
+  if (spA > 0) {
+    // Constant size on screen, whatever the zoom.
+    const x = lerp(SPARK_X, 0, easeIO(sp)), pul = 1 + 0.12 * Math.sin(t * 7);
+    glow(ctx, x, 0, 120 * pul / v.k, C.spark, 0.95 * spA);
+    ctx.save(); ctx.globalAlpha *= spA; ctx.fillStyle = '#fffbe6'; ctx.beginPath(); ctx.arc(x, 0, 24 * pul / v.k, 0, TAU); ctx.fill(); ctx.restore();
+  }
+  // Positive charge leaking from the fired cell through the tunnel into its neighbour.
+  const leak = seg(t, T.charge - 0.2, T.charge + 0.3) * (1 - seg(t, T.think + 0.2, T.think + 0.7));
+  if (leak > 0) {
+    // One at a time through the tunnel; each stays in the neighbour, so its charge visibly builds up.
+    // Each charge settles in its own slot round the neighbour's centre, so they never pile up.
+    const SLOT = [[-0.39, -0.24], [0.39, 0.24], [-0.25, 0.24], [0.25, -0.24], [-0.39, 0.24], [0.39, -0.24], [-0.25, -0.24], [0.25, 0.24]];
+    for (let n = 0; n < SLOT.length; n++) {
+      const ph = seg(t, T.charge - 0.2 + n * 0.26, T.charge + 1.2 + n * 0.26);
+      const sx = -BW * 0.32 + rand(n) * BW * 0.5, sy = (rand(n + 20) - 0.5) * BH * 0.5;
+      const ex = PITCH + SLOT[n][0] * BW, ey = SLOT[n][1] * BH;
+      const tx0 = BW / 2 - 10, tx1 = PITCH - BW / 2 + 10;
+      let x, y;
+      if (ph < 0.35) { const q = easeIO(ph / 0.35); x = lerp(sx, tx0, q); y = lerp(sy, 0, q); }
+      else if (ph < 0.6) { const q = (ph - 0.35) / 0.25; x = lerp(tx0, tx1, q); y = 0; }
+      else { const q = easeOut((ph - 0.6) / 0.4); x = lerp(tx1, ex, q); y = lerp(0, ey, q); }
+      ion(ctx, x, y, 'na', 12.5, alpha * leak * Math.min(1, ph * 10));
+    }
+  }
+  // The knock: one glowing dot through the tunnel that lands on the neighbour.
+  const kp = seg(t, T.think + 0.3, T.knock);
+  if (kp > 0 && t < T.knock + 0.8) {
+    G.drawKnock(ctx, { x: 0, y: 0, w: BW, h: BH }, { x: PITCH, y: 0, w: BW, h: BH }, { p: kp < 1 ? kp : 1, after: seg(t, T.knock, T.knock + 0.75), outcome: 'fires' }, { size: 16, alpha });
+  }
+  impactRings(ctx, PITCH, 0, 120, t, T.knock, alpha);
+  // Domino knocks down the row.
+  for (let i = 1; i < NROW - 1; i++) {
+    const p = seg(t, rowFire(i), rowFire(i + 1));
+    if (p > 0 && p < 1) G.drawKnock(ctx, { x: i * PITCH, y: 0, w: BW, h: BH }, { x: (i + 1) * PITCH, y: 0, w: BW, h: BH }, { p, after: 0, outcome: 'fires' }, { size: 14, alpha });
+  }
+  ctx.restore();
+
+  // Labels in screen space.
+  const vv = view(t);
+  G.tag(ctx, 'billions of muscle cells', 1010, 210, { size: 44, alpha: alpha * env(t, T.billions - 0.1, T.cells + 0.3, 0.4) });
+  const tun = toScr(vv, PITCH / 2, 0);
+  G.tag(ctx, 'tiny tunnels', tun[0], tun[1] - 230, { size: 40, alpha: alpha * env(t, T.tunnels - 0.15, T.firesW + 0.3, 0.25), to: [tun[0], tun[1] - 22] });
+  const c0 = toScr(vv, 0, 0);
+  // Left of the cell so it clears 'tiny tunnels' while that one fades out.
+  G.tag(ctx, 'fires', c0[0] - 60, c0[1] - 200, { size: 40, color: C.spark, alpha: alpha * env(t, T.firesW - 0.15, T.charge + 1.0, 0.25), to: [c0[0] - 30, c0[1] - 64] });
+  G.tag(ctx, '+ positive charge leaks through', tun[0], tun[1] + 230, { size: 40, color: C.na, alpha: alpha * env(t, T.charge, T.think + 0.1, 0.3) });
+  const c1 = toScr(vv, PITCH, 0);
+  G.tag(ctx, 'a knock', c1[0], c1[1] - 310, { size: 44, alpha: alpha * env(t, T.knock - 0.15, T.c1 + 0.5, 0.3) });
+}
+
+// ================================================================ cue 1: one spark becomes a wave
+const GRID = G.gridLayout({ cols: 12, rows: 8, box: { x: 150, y: 190, w: 1380, h: 720 } });
+const SPARK_CELL = GRID.idx(4, 4);
+// Knock steps from the spark cell (breadth first over the six neighbours).
+const HOPS = (() => {
+  const d = new Array(GRID.n).fill(Infinity); d[SPARK_CELL] = 0;
+  const q = [SPARK_CELL];
+  while (q.length) { const i = q.shift(); for (const j of GRID.nb[i]) if (d[j] > d[i] + 1) { d[j] = d[i] + 1; q.push(j); } }
+  return d;
+})();
+const MAXHOP = Math.max(...HOPS);
+const T_SPARK = T.spark + 0.25, STEP = (T.c2 - 0.5 - T_SPARK) / MAXHOP;
+const gridFire = i => T_SPARK + HOPS[i] * STEP;
+
+function drawGridWave(ctx, t, alpha, zoom) {
+  if (alpha <= 0) return;
+  ctx.save();
+  if (zoom) { ctx.translate(zoom.x, zoom.y); ctx.scale(zoom.k, zoom.k); ctx.translate(-zoom.x0, -zoom.y0); }
+  ctx.save(); ctx.globalAlpha *= alpha * 0.5; ctx.lineCap = 'round'; ctx.strokeStyle = 'rgba(190,205,240,0.55)'; ctx.lineWidth = GRID.cells[0].h * 0.16;
+  ctx.beginPath();
+  for (let i = 0; i < GRID.n; i++) for (const j of GRID.nb[i]) if (j > i) { ctx.moveTo(GRID.cells[i].x, GRID.cells[i].y); ctx.lineTo(GRID.cells[j].x, GRID.cells[j].y); }
+  ctx.stroke(); ctx.restore();
+  const sts = GRID.cells.map((c, i) => cellState(t, gridFire(i), Math.max(0.5, STEP * 1.6)));
+  GRID.cells.forEach((c, i) => { if (sts[i].halo > 0) glow(ctx, c.x, c.y, 130, C.spark, 0.8 * sts[i].halo * alpha); });
+  GRID.cells.forEach((c, i) => cellBrick(ctx, c.x, c.y, c.w, c.h, sts[i].st, { alpha }));
+  const s0 = GRID.cells[SPARK_CELL];
+  impactRings(ctx, s0.x, s0.y, 90, t, T_SPARK, alpha);
+  ctx.restore();
+  if (!zoom) {
+    G.tag(ctx, 'one spark', s0.x, 110, { size: 40, color: C.spark, alpha: alpha * env(t, T.spark - 0.2, T.c2 + 0.3, 0.25), to: [s0.x, s0.y - s0.h / 2 - 6] });
+    G.tag(ctx, 'a wave', 1000, 110, { size: 44, alpha: alpha * env(t, T.wave, T.c2 + 0.3, 0.3) });
+  }
+}
+
+// ================================================================ 3D heart
+const stage = createStage();
+const heart = await loadHeart(stage.renderer);
+stage.scene.add(heart.group);
+const A = heart.anchors;
+
+// heart3d keeps the wiring lit once the signal has passed and the AV node pulsing until the bottom fires.
+// Here the node has to go quiet once the signal leaves it down the wiring, and the wiring has to hand
+// back to the plain muscle look at the end, so both get a fade factor patched into their shaders.
+const FX = { wire: { value: 1 }, hold: { value: 1 } };
+heart.tubes.traverse(o => {
+  const m = o.material;
+  if (!m || !m.isShaderMaterial) return;
+  m.uniforms.uWireK = FX.wire;
+  m.fragmentShader = 'uniform float uWireK;\n' + m.fragmentShader.replace('1.0) * a;', '1.0) * a * uWireK;');
+  m.needsUpdate = true;
+});
+{
+  const hm = heart.mesh.material, base = hm.onBeforeCompile;
+  hm.onBeforeCompile = (sh, r) => {
+    base(sh, r);
+    sh.uniforms.uHoldK = FX.hold;
+    sh.fragmentShader = sh.fragmentShader.replace('uniform vec3 uSA, uAV;', 'uniform vec3 uSA, uAV; uniform float uHoldK;')
+      .replace('* hold * (0.9', '* hold * uHoldK * (0.9');
+  };
+  hm.customProgramCacheKey = () => 's04-hold-fade';
+  hm.needsUpdate = true;
+}
+
+// The insulating layer between the top and bottom chambers: a translucent plate across the heart's waist
+// at the level of the AV groove, with a hole where the AV node lets the signal through.
+const plate = (() => {
+  const axis = heart.regions.longAxis;
+  const n = axis.base.clone().sub(axis.apex).normalize();
+  const level = A.av.clone().sub(axis.apex).dot(n);
+  const centre = axis.apex.clone().addScaledVector(n, level - 0.02);
+  const u = new THREE.Vector3(1, 0, 0).addScaledVector(n, -n.x).normalize();
+  const v = new THREE.Vector3().crossVectors(n, u);
+  // Extent of the heart's cross-section at that level.
+  const P = heart.mesh.geometry.attributes.position;
+  let u0 = 0, u1 = 0, v0 = 0, v1 = 0;
+  const q = new THREE.Vector3();
+  for (let i = 0; i < P.count; i++) {
+    q.fromBufferAttribute(P, i).sub(centre);
+    if (Math.abs(q.dot(n)) > 0.03) continue;
+    const a = q.dot(u), b = q.dot(v);
+    u0 = Math.min(u0, a); u1 = Math.max(u1, a); v0 = Math.min(v0, b); v1 = Math.max(v1, b);
+  }
+  const m = 0.07;
+  u0 -= m; u1 += m; v0 -= m; v1 += m;
+  const w = u1 - u0, h = v1 - v0, cu = (u0 + u1) / 2, cv = (v0 + v1) / 2;
+  const avP = A.av.clone().sub(centre);
+  const hole = [(avP.dot(u) - u0) / w, (avP.dot(v) - v0) / h];
+  const cvs = document.createElement('canvas'); cvs.width = cvs.height = 1024;
+  const g = cvs.getContext('2d');
+  g.save(); g.translate(512, 512);
+  g.beginPath(); g.ellipse(0, 0, 500, 500, 0, 0, TAU);
+  const grad = g.createRadialGradient(0, 0, 50, 0, 0, 500);
+  grad.addColorStop(0, 'rgba(205,215,235,0.55)'); grad.addColorStop(0.85, 'rgba(205,215,235,0.7)'); grad.addColorStop(1, 'rgba(235,240,255,0.95)');
+  g.fillStyle = grad; g.fill();
+  g.lineWidth = 16; g.strokeStyle = 'rgba(245,248,255,1)'; g.stroke();
+  g.restore();
+  // The hole (the gateway), cut out with a soft rim.
+  const hx = hole[0] * 1024, hy = (1 - hole[1]) * 1024;
+  g.globalCompositeOperation = 'destination-out';
+  g.beginPath(); g.arc(hx, hy, 46, 0, TAU); g.fill();
+  g.globalCompositeOperation = 'source-over';
+  g.lineWidth = 8; g.strokeStyle = 'rgba(255,255,255,0.95)'; g.beginPath(); g.arc(hx, hy, 50, 0, TAU); g.stroke();
+  const tex = new THREE.CanvasTexture(cvs); tex.colorSpace = THREE.SRGBColorSpace;
+  const geo = new THREE.PlaneGeometry(w, h);
+  const mk = (depthTest, op) => new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: op, depthWrite: false, depthTest, side: THREE.DoubleSide, toneMapped: false });
+  const front = new THREE.Mesh(geo, mk(true, 0.85)), ghost = new THREE.Mesh(geo, mk(false, 0.3));
+  ghost.renderOrder = 3; front.renderOrder = 4;
+  const grp = new THREE.Group();
+  grp.add(ghost, front);
+  const basis = new THREE.Matrix4().makeBasis(u, v, n);
+  grp.quaternion.setFromRotationMatrix(basis);
+  grp.position.copy(centre).addScaledVector(u, cu).addScaledVector(v, cv);
+  heart.group.add(grp);
+  // Points on the rim (heart space) for the blocked marks, as fractions around the ellipse.
+  const rim = (ang, f = 0.78) => centre.clone().addScaledVector(u, cu + Math.cos(ang) * w / 2 * f).addScaledVector(v, cv + Math.sin(ang) * h / 2 * f);
+  return {
+    grp, rim, avOnPlate: centre.clone().addScaledVector(u, avP.dot(u)).addScaledVector(v, avP.dot(v)),
+    set(a) { grp.visible = a > 0.001; front.material.opacity = 0.85 * a; ghost.material.opacity = 0.3 * a; },
+  };
+})();
+
+const scr = p => { const w = p.clone().applyMatrix4(heart.group.matrixWorld).project(stage.camera); return [(w.x * 0.5 + 0.5) * W, (0.5 - w.y * 0.5) * H]; };
+const ans = name => { const s = heart.screen(name, stage.camera); return [s.x, s.y]; };
+
+// Wave timeline (heart3d WAVE): atria 0-0.32, AV hold 0.32-0.52, ventricles 0.52-0.82, fade to 1.
+const WAVE_PTS = [
+  [T.c2 - 0.2, 0], [T.sweeps - 0.3, 0.0], [T.squeeze - 0.2, 0.285], [T.gateway - 0.2, 0.285], [T.gateway + 0.5, 0.33],
+  [T.c4 - 0.2, 0.5], [T.c4 + 0.5, 0.515], [T.vFires - 0.5, 0.52], [T.within + 0.5, 0.82], [T.squeezes + 1.2, 1.0],
+];
+const waveAt = G.warp(WAVE_PTS);
+const PATH_PTS = [[T.fast - 0.4, 0.515], [T.middle - 0.1, 0.52], [T.middle + 0.9, 0.62], [T.around - 0.1, 0.62], [T.around + 1.3, 0.82], [T.c5 + 0.5, 0.9]];
+const pathAt = G.warp(PATH_PTS);
+
+function heartState(t) {
+  const s = { t, wave: waveAt(t) };
+  // Top chambers squeeze as the voice says so and stay tight through the hold; the bottom squeezes as one.
+  s.squeezeA = L(seg(t, T.squeeze - 0.2, T.squeeze + 0.3)) * (1 - L(seg(t, T.c4 - 0.3, T.c4 + 0.8)));
+  s.squeezeV = L(seg(t, T.squeezes - 0.1, T.squeezes + 0.35)) * (1 - L(seg(t, T.squeezes + 1.0, T.squeezes + 1.6)));
+  if (t > T.fast - 0.6) { s.paths = pathAt(t); s.pathsGhost = 0.9 * seg(t, T.fast - 0.4, T.fast + 0.3) * (1 - seg(t, T.c5, T.c5 + 0.8)); }
+  FX.hold.value = 1 - seg(t, T.c4 - 0.1, T.c4 + 0.7);
+  FX.wire.value = 1 - L(seg(t, T.squeezes + 0.6, T.squeezes + 1.8));
+  s.dim = 0.35 * env(t, T.c4 + 0.1, T.c5 + 0.4, 0.6);
+  // A cool (never electric) tint names the bottom chambers before they fire.
+  const hv = env(t, T.whole - 0.1, T.vFires - 0.2, 0.4);
+  if (hv > 0) { s.highlight = { ventricles: 0.35 * hv }; s.highlightColor = '#8ec9ff'; }
+  return s;
+}
+const L = p => p * p * (3 - 2 * p);
+
+function camera(t) {
+  // Front view; tilt down onto the layer for cue 3, back to the front for the wiring and the squeeze.
+  const tilt = L(seg(t, T.c3 - 0.2, T.c3 + 1.0)) * (1 - L(seg(t, T.c4 - 0.2, T.c4 + 1.0)));
+  const yaw = lerp(-6, 6, seg(t, T.c2 - 0.4, T.c5 + 6));
+  stage.orbit(yaw + 8 * tilt, lerp(3, 24, tilt), lerp(5.4, 5.2, tilt), new THREE.Vector3(0.0, lerp(-0.05, 0.02, tilt), 0));
+}
+
+// Blocked marks: knocks dropping onto the layer and bouncing off, each leaving an X.
+const BLOCK = [[Math.PI * 0.62, 0.0], [Math.PI * 0.82, 0.35], [Math.PI * 1.1, 0.7], [Math.PI * 0.38, 0.2], [Math.PI * 1.9, 0.55]];
+function drawBlocks(ctx, t, alpha) {
+  if (alpha <= 0) return;
+  for (const [ang, dl] of BLOCK) {
+    const p3 = plate.rim(ang, 0.62);
+    const [x, y] = scr(p3);
+    const t0 = T.blocks - 0.2 + dl;
+    const p = seg(t, t0 - 0.55, t0);
+    if (p <= 0) continue;
+    if (t < t0 + 0.75) G.drawKnock(ctx, { x, y: y - 130 }, { x, y }, { p: Math.min(1, p), after: seg(t, t0, t0 + 0.75), outcome: 'ignored' }, { size: 14, alpha, cross: false });
+    const xa = alpha * seg(t, t0, t0 + 0.2);
+    if (xa > 0) {
+      ctx.save(); ctx.globalAlpha *= xa; ctx.fillStyle = 'rgba(10,16,44,0.9)'; ctx.beginPath(); ctx.arc(x, y - 4, 22, 0, TAU); ctx.fill();
+      ctx.strokeStyle = '#ff8a9a'; ctx.lineWidth = 7; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(x - 10, y - 14); ctx.lineTo(x + 10, y + 6); ctx.moveTo(x + 10, y - 14); ctx.lineTo(x - 10, y + 6); ctx.stroke(); ctx.restore();
+    }
+  }
+}
+
+// 0.1 s timer ring round the AV node: fills while the signal is held.
+function holdTimer(ctx, x, y, t, alpha) {
+  if (alpha <= 0) return;
+  const p = seg(t, T.tenth - 0.2, T.c4 - 0.2);
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.lineWidth = 9; ctx.strokeStyle = 'rgba(255,255,255,0.22)'; ctx.beginPath(); ctx.arc(x, y, 58, 0, TAU); ctx.stroke();
+  ctx.strokeStyle = '#ffffff'; ctx.lineCap = 'round'; ctx.beginPath(); ctx.arc(x, y, 58, -Math.PI / 2, -Math.PI / 2 + TAU * p); ctx.stroke();
+  ctx.restore();
+}
+
+// While the signal is held, drops of blood fall from each top chamber into the bottom one below it.
+function bloodDrops(ctx, t, alpha) {
+  if (alpha <= 0) return;
+  const pairs = [[ans('ra'), ans('rv')], [ans('la'), ans('lv')]];
+  pairs.forEach(([a, b], k) => {
+    for (let n = 0; n < 3; n++) {
+      const u = (t - T.tenth) / 0.8 + n / 3 + k * 0.17, p = u - Math.floor(u);
+      // Run a little past both chamber centres so each drop is seen to cross the layer.
+      const q = lerp(-0.2, 1.5, p * p), x = lerp(a[0], b[0], q) + (rand(n + 3 * k) - 0.5) * 30, y = lerp(a[1], b[1], q);
+      const r = 11;
+      ctx.save(); ctx.globalAlpha *= alpha * Math.sin(Math.PI * p);
+      ctx.translate(x, y);
+      ctx.beginPath(); ctx.moveTo(0, -r * 2); ctx.quadraticCurveTo(r * 1.05, -r * 0.4, r, 0); ctx.arc(0, 0, r, 0, Math.PI); ctx.quadraticCurveTo(-r * 1.05, -r * 0.4, 0, -r * 2); ctx.closePath();
+      ctx.fillStyle = '#e8243a'; ctx.fill(); ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 3; ctx.stroke();
+      ctx.restore();
+    }
+  });
+}
+
+function drawHeart(ctx, t, alpha) {
+  if (alpha <= 0) return;
+  camera(t);
+  heart.update(heartState(t));
+  plate.set(env(t, T.c3 + 0.1, T.c4 + 0.6, 0.6));
+  stage.render(t);
+  ctx.save(); ctx.globalAlpha = alpha; ctx.drawImage(stage.canvas, 0, 0); ctx.restore();
+  heart.group.updateMatrixWorld();
+
+  // ---- cue 2: top chambers
+  const ra = ans('ra'), la = ans('laAur');
+  const tc = alpha * env(t, T.top - 0.1, T.c3 + 0.3, 0.3);
+  if (tc > 0) {
+    const tx = 960, ty = 92;
+    ctx.save(); ctx.globalAlpha *= tc; ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 3;
+    for (const p of [ra, la]) { ctx.beginPath(); ctx.moveTo(tx + Math.sign(p[0] - tx) * 80, ty + 24); ctx.lineTo(p[0], p[1]); ctx.stroke(); ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(p[0], p[1], 7, 0, TAU); ctx.fill(); }
+    ctx.restore();
+    G.tag(ctx, 'top chambers', tx, ty, { size: 44, alpha: tc });
+  }
+  G.tag(ctx, 'they squeeze', 400, 560, { size: 44, alpha: alpha * env(t, T.squeeze - 0.2, T.c3 + 0.2, 0.3) });
+
+  // ---- cue 3: the layer and its one gateway
+  const lay = plate.rim(Math.PI * 1.0, 1.0), lp = scr(lay);
+  G.tag(ctx, 'a layer that blocks the signal', 420, 300, { size: 40, alpha: alpha * env(t, T.layer, T.gateway - 0.3, 0.3), to: lp });
+  drawBlocks(ctx, t, alpha * (1 - seg(t, T.gateway - 0.3, T.gateway + 0.2)));
+  const av = scr(plate.avOnPlate);
+  const ga = alpha * env(t, T.gateway - 0.1, T.c4 + 0.3, 0.3);
+  if (ga > 0) glow(ctx, av[0], av[1], 120, C.spark, 0.35 * ga * (0.8 + 0.2 * Math.sin(t * 8)));
+  G.tag(ctx, 'one gateway: the AV node', 400, 520, { size: 40, color: C.spark, alpha: ga, to: [av[0] - 62, av[1]] });
+  holdTimer(ctx, av[0], av[1], t, alpha * env(t, T.tenth - 0.3, T.c4 + 0.2, 0.3));
+  const ha = alpha * env(t, T.holds - 0.1, T.c4 + 0.2, 0.3);
+  text(ctx, 'held back', 400, 620, 40, C.text, 'center', 700, ha);
+  text(ctx, '0.1 s', 400, 690, 64, C.text, 'center', 800, alpha * env(t, T.tenth - 0.2, T.c4 + 0.2, 0.3));
+  bloodDrops(ctx, t, alpha * env(t, T.tenth - 0.2, T.c4 - 0.1, 0.4));
+  G.tag(ctx, 'top chambers finish filling the bottom ones', 410, 800, { size: 34, alpha: alpha * env(t, T.topUp, T.c4 + 0.2, 0.3), to: ans('ra') });
+
+  // ---- cue 4: the fast wiring
+  const sm = ans('septumMid');
+  G.tag(ctx, 'fast wiring', 400, 420, { size: 48, color: C.spark, alpha: alpha * env(t, T.fast - 0.1, T.c5, 0.3) });
+  text(ctx, 'special cells built for speed', 400, 494, 36, C.text, 'center', 600, alpha * env(t, T.special - 0.1, T.middle - 0.1, 0.3));
+  G.tag(ctx, 'through the middle', 400, 560, { size: 40, alpha: alpha * env(t, T.middle - 0.15, T.around + 0.45, 0.25), to: sm });
+  const lv = ans('lvLat'), rv = ans('rvWall');
+  G.tag(ctx, 'around the bottom chambers', 400, 640, { size: 40, alpha: alpha * env(t, T.around - 0.1, T.c5, 0.3), to: rv });
+
+  // ---- cue 5: the whole bottom fires and squeezes
+  G.tag(ctx, 'the whole bottom', 400, 560, { size: 44, alpha: alpha * env(t, T.whole + 0.05, T.within - 0.2, 0.3), to: ans('ventMid') });
+  G.tag(ctx, 'fires within 0.1 s', 1500, 560, { size: 44, color: C.spark, alpha: alpha * env(t, T.within - 0.1, TIMING.duration + 1, 0.3) });
+  G.tag(ctx, 'squeezes as one', 1500, 660, { size: 44, alpha: alpha * env(t, T.squeezes - 0.1, TIMING.duration + 1, 0.3) });
+}
+
+// ================================================================ main
+function draw(ctx, t) {
+  const rowA = 1 - seg(t, T.spark - 0.3, T.spark);
+  drawSheet(ctx, t, rowA);
+  stateKey(ctx, 1590, 36, 1 - seg(t, T.c2 - 0.5, T.c2 - 0.1));
+  // Grid, then it shrinks into the top of the heart where the wave starts.
+  const sa = (() => { camera(T.c2); heart.group.updateMatrixWorld(); return ans('sa'); })();
+  // The grid is almost gone before the heart shows, so the fired grid never sits over the heart.
+  const z = L(seg(t, T.c2 - 0.55, T.c2 - 0.15));
+  const gA = seg(t, T.spark - 0.25, T.spark + 0.05) * (1 - seg(t, T.c2 - 0.5, T.c2 - 0.2));
+  const heartA = seg(t, T.c2 - 0.3, T.c2 + 0.2);
+  if (heartA > 0) drawHeart(ctx, t, heartA);
+  drawGridWave(ctx, t, gA, z > 0 ? { x: lerp(840, sa[0], z), y: lerp(550, sa[1], z), k: 1 - 0.85 * z, x0: 840, y0: 550 } : null);
+  // Drawn over the row-to-grid cut so it stays up long enough to read.
+  G.tag(ctx, 'like dominoes', 960, 790, { size: 44, alpha: env(t, T.dominoes - 0.15, T.spark + 0.4, 0.25) });
+  badge(ctx, 'slow motion', env(t, T.c2 + 0.2, TIMING.duration + 1, 0.4));
+}
+
+window.S04 = { T, heart, plate };
+setup(draw);
+</script>

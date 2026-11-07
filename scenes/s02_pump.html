@@ -1,0 +1,379 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>s02 pump</title>
+<script src="lib.js"></script>
+<script src="shared.js"></script>
+<script src="grid2d.js"></script>
+<script type="importmap">{"imports":{"three":"../node_modules/three/build/three.module.js","three/addons/":"../node_modules/three/examples/jsm/"}}</script>
+<script type="module">
+// Part 2, the pump. 3D cutaway heart: two pumps side by side (its right is on your left), each with an atrium
+// on top and a ventricle below. Then the heart shrinks into the clean 2D figure-8 loop (lungs once on top,
+// body once below, one leg lit at a time). Back to the 3D cutaway: the bottom chambers fill by themselves,
+// the top ones top them up, the bottom ones do the real pumping. Then the heart stops: who gives the order?
+import { loadHeart, createStage, beat } from './heart3d.js';
+const G = window.G2;
+const TAU = Math.PI * 2;
+
+const stage = createStage();
+const heart = await loadHeart(stage.renderer);
+stage.scene.add(heart.group);
+
+// When the voice says each word: seconds after the cue starts, measured from the narration's word timings
+// (the character-share estimate was up to 0.6 s late on "on your left", "the ventricle" and "real pumping").
+const at = (i, dt) => cs(i) + dt;
+const T = {
+  c0: cs(0), twoPumps: at(0, 0.79), sideBySide: at(0, 1.53), facing: at(0, 2.65), itsRight: at(0, 3.56), yourLeft: at(0, 4.31),
+  c1: cs(1), small: at(1, 0.89), atrium: at(1, 2.46), big: at(1, 3.24), ventricle: at(1, 4.71),
+  c2: cs(2), sends: at(2, 0.91), oxygen: at(2, 2.28), comesBack: at(2, 3.58), roundBody: at(2, 5.33), backRight: at(2, 7.26),
+  c3: cs(3), drops: at(3, 1.31), topOnes: at(3, 3.1), topUp: at(3, 4.65), bottomOnes: at(3, 5.48), real: at(3, 6.43),
+  c4: cs(4), muscle: at(4, 0.23), order: at(4, 2.99),
+};
+// The 3D heart hands over to the 2D loop between cues 1 and 2, and takes back over between cues 2 and 3.
+// On the way back the loop is fully gone (LOOP_GONE) before the heart starts to appear, so the two never overlap.
+const OPEN = [T.c0 + 0.05, T.twoPumps + 0.15];
+const LOOP_IN = [cs(2) - 0.1, cs(2) + 0.6], LOOP_GONE = ce(2) + 0.2, LOOP_OUT = [LOOP_GONE, cs(3) + 0.5];
+
+// Blood colours exist only in this scene: used (blue) on the heart's right side, fresh (red) on its left.
+const BLUE = '#5a7bea', RED = '#d8344e';
+const BLUE_TXT = '#9db4ff', RED_TXT = '#ff8a9a';
+const easeIn = p => p * p;
+
+// ================================================================ 3D heart state
+// Fill levels in cue 3 (0 empty, 1 full) and the squeezes that drive them.
+function cycle(t) {
+  // A real ventricle never empties: about a third stays behind, which also keeps the cavities from looking hollow.
+  // Done well before "The top ones", so the gauge sits on its 75% line while that sentence is still on screen.
+  const passive = easeIO(seg(t, T.drops - 0.6, T.drops + 0.8));              // drops in by itself: 30% -> 75%
+  const kick = easeIO(seg(t, T.topOnes + 0.25, T.topUp + 0.3));              // top-up: 75% -> 100%
+  const eject = easeIO(seg(t, T.bottomOnes + 0.3, T.real + 0.5));            // pumped out: 100% -> 30%
+  const vent = 0.3 + 0.45 * passive + 0.25 * kick - 0.7 * eject;
+  const atria = 0.85 - 0.45 * kick + 0.45 * easeIO(seg(t, T.real, ce(3)));
+  const squeezeA = 0.9 * seg(t, T.topOnes + 0.15, T.topOnes + 0.55) * (1 - seg(t, T.topUp + 0.4, T.topUp + 0.9));
+  const squeezeV = seg(t, T.bottomOnes + 0.2, T.bottomOnes + 0.6) * (1 - seg(t, T.real + 0.8, ce(3) + 0.2));
+  return { vent, atria, squeezeA, squeezeV, passive, kick, eject };
+}
+
+function heartState(t) {
+  const s = { t, blood: { ra: BLUE, rv: BLUE, la: RED, lv: RED } };
+  // The cutaway opens as the voice starts, so it is open by "two pumps". It closes with a cross-fade in draw().
+  s.cutaway = easeIO(seg(t, OPEN[0], OPEN[1]));
+  // Switch to the filling cycle while the heart is hidden behind the 2D loop, so the levels never jump on screen.
+  if (t < LOOP_IN[1]) {
+    // A calm, gentle heartbeat while the chambers are introduced.
+    const b = beat((t - 0.4) * 62 / 60);
+    s.squeezeA = 0.55 * b.squeezeA; s.squeezeV = 0.45 * b.squeezeV;
+    s.fill = { ra: 0.82, la: 0.82, rv: 0.78, lv: 0.78 };
+  } else {
+    const c = cycle(t);
+    s.squeezeA = c.squeezeA; s.squeezeV = c.squeezeV;
+    s.fill = { ra: c.atria, la: c.atria, rv: c.vent, lv: c.vent };
+  }
+  // Soft white rim on whatever the voice is naming (only once the cut is open, or it washes over the closed front).
+  const hiR = env(t, Math.max(OPEN[1], T.twoPumps), T.facing, 0.35), hiL = env(t, Math.max(OPEN[1] + 0.3, T.sideBySide - 0.1), T.facing, 0.35);
+  const hiA = env(t, T.small - 0.1, T.big, 0.35), hiV = env(t, T.big - 0.1, ce(1), 0.35);
+  // No rim in cue 3: on a squeezed chamber it reads as a glass bubble, and the numbered steps already say which.
+  s.highlight = { ra: Math.max(hiR, hiA), rv: Math.max(hiR, hiV), la: Math.max(hiL, hiA), lv: Math.max(hiL, hiV) };
+  for (const k in s.highlight) s.highlight[k] *= 0.85;
+  s.highlightColor = '#ffffff';
+  s.dim = 0.18 * seg(t, T.muscle, T.muscle + 1.2);
+  return s;
+}
+
+function camera(t) {
+  // Closed heart first, then a small push in as the cutaway opens. In cue 4 the heart slides right to make room for the question.
+  const open = easeIO(seg(t, OPEN[0], OPEN[1] + 0.5));
+  const shut = easeIO(seg(t, T.c4 - 0.1, T.c4 + 1.6));
+  const yaw = lerp(-14, 0, easeIO(seg(t, 0, T.twoPumps + 0.8)));
+  const dist = lerp(4.9, 4.45, open) + 0.35 * shut - 0.12 * seg(t, T.c4, TIMING.duration);
+  stage.orbit(yaw, 4, dist, new THREE_V(lerp(0, -0.85, shut), lerp(-0.1, -0.2, open) + 0.1 * shut, 0));
+}
+// orbit wants a THREE.Vector3; heart.group.position is one, so borrow its constructor instead of importing three.
+const THREE_V = heart.group.position.constructor;
+
+// ================================================================ 2D helpers
+function title(ctx, s, alpha, size = 50) { text(ctx, s, 80, 88, size, C.text, 'left', 700, alpha); }
+
+// A label with a thin leader line and a dot on the thing it names.
+function label(ctx, s, x, y, to, o = {}) {
+  const a = o.alpha ?? 1;
+  if (a <= 0) return;
+  const align = o.align || 'right', size = o.size || 44;
+  ctx.save(); ctx.globalAlpha *= a;
+  ctx.font = `800 ${size}px ${FONT}`;
+  const w = ctx.measureText(s).width;
+  if (to) {
+    const sx = align === 'right' ? x + 18 : x - 18;
+    ctx.strokeStyle = 'rgba(255,255,255,0.75)'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(sx, y); ctx.lineTo(to[0], to[1]); ctx.stroke();
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(to[0], to[1], 8, 0, TAU); ctx.fill();
+  }
+  ctx.restore();
+  text(ctx, s, x, y, size, o.color || C.text, align, 800, a);
+  if (o.sub) text(ctx, o.sub, x, y + size * 0.5 + 26, 32, o.subColor || C.dim, align, 700, a * (o.subAlpha ?? 1));
+  return w;
+}
+
+// A person facing the viewer. Its right arm (on the viewer's left) lifts by `raise`.
+function person(ctx, x, y, s, alpha, raise) {
+  if (alpha <= 0) return;
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.translate(x, y); ctx.scale(s, s);
+  ctx.fillStyle = '#22305f'; ctx.strokeStyle = 'rgba(205,218,248,0.95)'; ctx.lineWidth = 4;
+  const limb = (sx, sy, ang, len, w) => {
+    ctx.save(); ctx.translate(sx, sy); ctx.rotate(ang);
+    roundRect(ctx, -w / 2, -w / 2, w, len, w / 2); ctx.fill(); ctx.stroke();
+    ctx.restore();
+  };
+  limb(-30, 100, 0.03, 160, 46); limb(30, 100, -0.03, 160, 46);
+  limb(-68, -66, lerp(0.14, Math.PI * 0.86, easeIO(raise)), 168, 38);
+  limb(68, -66, -0.14, 168, 38);
+  roundRect(ctx, -78, -96, 156, 214, 44); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.arc(0, -152, 46, 0, TAU); ctx.fill(); ctx.stroke();
+  // Its heart sits a little to its left: the viewer's right.
+  ctx.translate(26, -32); ctx.scale(1.1, 1.1);
+  ctx.fillStyle = C.blood;
+  ctx.beginPath(); ctx.moveTo(0, 14); ctx.bezierCurveTo(-26, -4, -16, -24, 0, -12); ctx.bezierCurveTo(16, -24, 26, -4, 0, 14); ctx.fill();
+  ctx.restore();
+}
+// Where the raised hand ends up (frame pixels), for the tag above it.
+const handAt = (x, y, s, raise) => {
+  const a = lerp(0.14, Math.PI * 0.86, easeIO(raise)), len = 168 - 19;
+  return [x + s * (-68 - Math.sin(a) * len), y + s * (-66 + Math.cos(a) * len)];
+};
+
+const scr = k => { const p = heart.screen(k, stage.camera); return [p.x, p.y]; };
+
+// ================================================================ cues 0 and 1: two pumps, four chambers
+// Label columns either side of the cutaway: the heart's right side on the viewer's left, and its left on the right.
+const XL = 670, XR = 1290;
+const FIG = { x: 205, y: 580, s: 0.95 };
+function drawPumps(ctx, t) {
+  const out = 1 - seg(t, LOOP_IN[0] - 0.3, LOOP_IN[0] + 0.05);
+  if (out <= 0) return;
+  title(ctx, 'Two pumps, side by side', out * env(t, T.twoPumps - 0.2, T.c1 + 0.1, 0.4));
+  title(ctx, 'Each pump has two chambers', out * env(t, T.c1 + 0.2, ce(1) + 1, 0.4));
+  // Person facing us: its right hand goes up on our left.
+  const fa = env(t, T.facing - 0.3, T.c1 + 0.2, 0.4);
+  const raise = seg(t, T.itsRight - 0.35, T.itsRight + 0.35);
+  person(ctx, FIG.x, FIG.y, FIG.s, fa, raise);
+  const [hx, hy] = handAt(FIG.x, FIG.y, FIG.s, raise);
+  G.tag(ctx, 'its right', Math.max(110, hx), hy - 56, { size: 34, color: BLUE_TXT, alpha: fa * seg(t, T.itsRight, T.itsRight + 0.3) });
+  G.tag(ctx, 'its right side is on your left', 330, 880, { size: 34, alpha: fa * seg(t, T.yourLeft - 0.2, T.yourLeft + 0.2) });
+  // Pump names beside the heart, on the same sides as the figure's hands.
+  const ra = scr('cutRa'), la = scr('cutLa'), rv = scr('cutRv'), lv = scr('cutLv');
+  // "Two pumps, side by side": a faint dashed line down the wall between them. The anchors are surface
+  // points, not on the cut face, so the line runs through offsets from the cavity centres, fitted by eye.
+  const mA = [(ra[0] + la[0]) / 2, (ra[1] + la[1]) / 2], mV = [(rv[0] + lv[0]) / 2, (rv[1] + lv[1]) / 2];
+  const split = [[mA[0] - 4, mA[1] - 100], [mA[0], mA[1]], [mV[0] - 15, mV[1] - 94], [mV[0] + 18, mV[1]], [mV[0] + 40, mV[1] + 172]];
+  G.pathArrow(ctx, split, 0, 1, { color: '#ffffff', width: 6, dash: [16, 12], head: 0, alpha: 0.7 * env(t, T.twoPumps + 0.2, T.c1, 0.5) });
+  const pa = out * seg(t, T.itsRight - 0.1, T.itsRight + 0.3), pb = out * seg(t, T.yourLeft - 0.2, T.yourLeft + 0.2);
+  const big = 1 - easeIO(seg(t, T.c1 - 0.3, T.c1 + 0.4));
+  const yp = lerp(300, (ra[1] + rv[1]) / 2 - 20, big);
+  text(ctx, 'RIGHT pump', XL, yp, lerp(38, 52, big), BLUE_TXT, 'right', 800, pa);
+  text(ctx, 'LEFT pump', XR, yp, lerp(38, 52, big), RED_TXT, 'left', 800, pb);
+  // Cue 1: the description first ("small, on top"), then its name as the voice says it.
+  const aA = out * seg(t, T.small - 0.1, T.small + 0.3), aV = out * seg(t, T.big - 0.1, T.big + 0.3);
+  const nA = seg(t, T.atrium - 0.1, T.atrium + 0.3), nV = seg(t, T.ventricle - 0.1, T.ventricle + 0.3);
+  const dimA = lerp(1, 0.5, seg(t, T.big - 0.2, T.big + 0.3));
+  const lab = (name, sub, x, y, to, align, a, n) => {
+    label(ctx, name, x, y - 24, to, { align, alpha: a * n, size: 48 });
+    text(ctx, sub, x, y + 28, 34, C.dim, align, 700, a);
+  };
+  lab('atrium', 'small, on top', XL, ra[1], [ra[0] - 20, ra[1] - 20], 'right', aA * dimA, nA);
+  lab('atrium', 'small, on top', XR, la[1], [la[0] + 20, la[1] - 20], 'left', aA * dimA, nA);
+  lab('ventricle', 'big, muscly, below', XL, rv[1] + 40, [rv[0] - 30, rv[1] + 16], 'right', aV, nV);
+  lab('ventricle', 'big, muscly, below', XR, lv[1] + 40, [lv[0] + 20, lv[1] + 16], 'left', aV, nV);
+}
+
+// ================================================================ cue 2: the figure-8 loop
+const CIRC = { x: 960, y: 528, s: 0.86 };
+// Blob position along the four legs (0..4), each leg moving while the voice describes it.
+const blobU = G.warp([
+  [T.sends - 0.2, 0], [T.oxygen + 0.5, 0.95], [T.comesBack - 0.1, 1.0],
+  [T.roundBody - 0.3, 1.97], [T.roundBody, 2.0], [T.backRight - 0.3, 2.97], [T.backRight, 3.0], [ce(2) - 0.2, 3.97],
+]);
+// The loop's leg names (local coords as in grid2d), each fading in just before its words.
+// "round the body" sits up and left of the library spot so it clears the blood key.
+const LEG_TAGS = [
+  ['to the lungs', -330, -250, wordAt(2, 'to the lungs') - 0.15],
+  ['back to the left pump', 330, -250, wordAt(2, 'back to the left') - 0.15],
+  ['round the body', 335, 100, wordAt(2, 'round the body') - 0.15],
+  ['back to the right pump', -440, 250, wordAt(2, 'back to the right') - 0.15],
+];
+// Same look as the loop's own key, with the small print at full label size.
+function bloodKey(ctx, x, y, alpha) {
+  if (alpha <= 0) return;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.fillStyle = 'rgba(5,10,30,0.7)'; roundRect(ctx, x, y, 450, 180, 18); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth = 2; ctx.stroke();
+  for (const [dy, col] of [[42, 'rgb(74,120,235)'], [92, 'rgb(232,64,84)']]) {
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x + 40, y + dy, 16, 0, TAU); ctx.fill();
+  }
+  ctx.restore();
+  text(ctx, 'blue = used', x + 72, y + 43, 34, C.text, 'left', 800, alpha);
+  text(ctx, 'red = fresh', x + 72, y + 93, 34, C.text, 'left', 800, alpha);
+  text(ctx, '(real blood is always red)', x + 24, y + 145, 30, C.dim, 'left', 700, alpha);
+}
+function drawLoop(ctx, t) {
+  const a = Math.min(seg(t, LOOP_IN[0] + 0.3, LOOP_IN[1]), 1 - seg(t, LOOP_GONE - 0.5, LOOP_GONE));
+  if (a <= 0) return;
+  const u = blobU(t);
+  G.circulation(ctx, CIRC.x, CIRC.y, CIRC.s, u, {
+    alpha: a, blob: t > T.sends - 0.4, legLabels: 0,
+    active: t < T.sends - 0.3 ? -1 : undefined,
+    key: 0,
+  });
+  // Leg names, drawn here rather than by the loop so each lands on its own words, not when the blob changes leg.
+  // A name stays up until the next one arrives, and at least ~1.2 s once fully in.
+  LEG_TAGS.forEach(([s, x, y, t0], k) => {
+    const next = LEG_TAGS[k + 1]?.[3] ?? TIMING.duration, t1 = Math.max(next, t0 + 1.45);
+    G.tag(ctx, s, CIRC.x + x * CIRC.s, CIRC.y + y * CIRC.s, { size: 30, alpha: a * seg(t, t0, t0 + 0.2) * (1 - seg(t, t1, t1 + 0.25)) });
+  });
+  bloodKey(ctx, 1400, 640, a * seg(t, T.sends, T.sends + 0.5));
+  // Oxygen is picked up in the lungs, where the blob turns red.
+  G.tag(ctx, 'picks up oxygen', CIRC.x, CIRC.y - CIRC.s * 470 - 42, { size: 32, color: '#ffd0da', alpha: a * env(t, T.oxygen - 0.1, T.comesBack + 0.3, 0.3) });
+}
+
+// ================================================================ cue 3: filling and pumping
+function drawCycle(ctx, t) {
+  const a = env(t, LOOP_OUT[1] - 0.2, ce(3) + 0.35, 0.4);
+  if (a <= 0) return;
+  const c = cycle(t);
+  title(ctx, 'One heartbeat', a);
+  // The three steps, each lit while the voice says it.
+  const steps = [
+    ['Fills by itself', T.c3, T.topOnes - 0.15],
+    ['Top-up', T.topOnes - 0.15, T.real],
+    ['Real pumping', T.real, ce(3) + 1],
+  ];
+  steps.forEach(([s, t0, t1], k) => {
+    const on = seg(t, t0 - 0.2, t0 + 0.2), cur = on * (1 - seg(t, t1 - 0.2, t1 + 0.2));
+    const y = 330 + k * 110, al = a * on * lerp(0.4, 1, cur);
+    if (al <= 0) return;
+    ctx.save(); ctx.globalAlpha *= al;
+    ctx.fillStyle = cur > 0.5 ? '#ffffff' : 'rgba(255,255,255,0.35)';
+    ctx.beginPath(); ctx.arc(122, y, 26, 0, TAU); ctx.fill();
+    ctx.restore();
+    text(ctx, String(k + 1), 122, y + 1, 30, '#0a1230', 'center', 800, al);
+    text(ctx, s, 170, y, 44, C.text, 'left', 800, al);
+  });
+  // Blood dropping from the top chambers into the bottom ones.
+  const ra = scr('cutRa'), la = scr('cutLa'), rv = scr('cutRv'), lv = scr('cutLv');
+  const flowA = env(t, T.drops - 0.6, T.topUp + 0.5, 0.4);
+  if (flowA > 0) {
+    for (const [p, q] of [[ra, rv], [la, lv]]) {
+      const ph = (t * 0.9) % 1;
+      G.pathArrow(ctx, [[p[0], p[1] + 20], [q[0], q[1] - 30]], 0, 1, { color: '#ffffff', width: 7, dash: [14, 14], head: 26, alpha: a * flowA * 0.85 });
+    }
+  }
+  // Out through the top when the bottom chambers squeeze.
+  const outA = env(t, T.bottomOnes + 0.3, T.real + 1.0, 0.3);
+  if (outA > 0) {
+    // They leave from the top of the heart: used blood towards the lungs, fresh blood towards the body.
+    const g = easeOut(seg(t, T.bottomOnes + 0.3, T.real + 0.3));
+    const x0 = (ra[0] + la[0]) / 2, y0 = Math.min(ra[1], la[1]) - 150;
+    const tagA = a * outA * seg(g, 0.6, 0.9);
+    for (const [d, col, name] of [[-1, '#b3c6ff', 'to lungs'], [1, '#ffa3b1', 'to body']]) {
+      const tip = [x0 + d * 250, y0 - 170];
+      ctx.save(); ctx.shadowColor = col; ctx.shadowBlur = 28;
+      G.pathArrow(ctx, [[x0 + d * 20, y0], [x0 + d * 80, y0 - 110], tip], 0, g, { color: col, width: 24, dash: false, head: 60, alpha: a * outA, shadow: false });
+      ctx.restore();
+      G.tag(ctx, name, tip[0] + d * 30, tip[1] - 52, { size: 36, color: col, alpha: tagA });
+    }
+  }
+  // How full the bottom chambers are.
+  const gx = 1560, gy0 = 330, gh = 430, gw = 74;
+  const fillTo = c.vent;
+  ctx.save(); ctx.globalAlpha *= a;
+  ctx.fillStyle = 'rgba(5,10,30,0.6)'; roundRect(ctx, gx - gw / 2, gy0, gw, gh, 20); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 3; ctx.stroke();
+  ctx.save(); roundRect(ctx, gx - gw / 2, gy0, gw, gh, 20); ctx.clip();
+  const lv75 = gy0 + gh * 0.25;
+  const yF = gy0 + gh * (1 - fillTo);
+  // Neutral greys, not blood red: the gauge is "how full", and both pumps fill the same way.
+  ctx.fillStyle = '#8f9bc0'; ctx.fillRect(gx - gw / 2, Math.max(yF, lv75), gw, gy0 + gh - Math.max(yF, lv75));
+  if (yF < lv75) { ctx.fillStyle = '#e8ecf8'; ctx.fillRect(gx - gw / 2, yF, gw, lv75 - yF); }
+  ctx.restore();
+  ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.setLineDash([8, 8]); ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(gx - gw / 2 - 14, lv75); ctx.lineTo(gx + gw / 2 + 14, lv75); ctx.stroke();
+  ctx.restore();
+  text(ctx, 'Bottom chambers', gx, gy0 - 64, 34, C.text, 'center', 800, a);
+  text(ctx, 'fills by itself', gx + gw / 2 + 24, lv75 - 20, 30, C.text, 'left', 800, a);
+  text(ctx, '~75%', gx + gw / 2 + 24, lv75 + 20, 30, C.dim, 'left', 800, a);
+  // What the squeeze empties, named on the far side so it never sits on the 75% label.
+  const pa = a * seg(t, T.bottomOnes + 0.5, T.bottomOnes + 0.9);
+  if (pa > 0) {
+    const yp = (gy0 + Math.max(yF, gy0 + 60)) / 2;
+    G.pathArrow(ctx, [[gx - gw / 2 - 40, yp + 50], [gx - gw / 2 - 40, yp - 60]], 0, 1, { color: '#ffffff', width: 6, dash: false, head: 22, alpha: pa });
+    text(ctx, 'pushed out', gx - gw / 2 - 64, yp, 32, C.text, 'right', 800, pa);
+  }
+}
+
+// ================================================================ cue 4: who gives the order?
+function drawOrder(ctx, t) {
+  text(ctx, "Muscle can't decide", 120, 420, 50, C.text, 'left', 800, seg(t, T.muscle + 0.2, T.muscle + 0.7));
+  text(ctx, 'when to squeeze', 120, 482, 50, C.text, 'left', 800, seg(t, T.muscle + 0.2, T.muscle + 0.7));
+  const q = seg(t, T.order - 0.1, T.order + 0.4);
+  if (q > 0) {
+    ctx.save(); ctx.globalAlpha = q;
+    ctx.translate(120, 620); const k = 1.08 - 0.08 * easeOut(q); ctx.scale(k, k);
+    ctx.font = `800 76px ${FONT}`; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.shadowColor = 'rgba(255,255,255,0.35)'; ctx.shadowBlur = 24;
+    ctx.fillStyle = '#ffffff'; ctx.fillText('Who gives the order?', 0, 0);
+    ctx.restore();
+  }
+}
+
+// ================================================================ main
+// The 3D stage paints its own background; a soft round mask keeps its edges from showing as a box while it shrinks.
+const maskCanvas = document.createElement('canvas');
+maskCanvas.width = W; maskCanvas.height = H;
+function masked(c) {
+  const m = maskCanvas.getContext('2d');
+  m.globalCompositeOperation = 'source-over';
+  m.clearRect(0, 0, W, H);
+  m.drawImage(stage.canvas, 0, 0);
+  m.globalCompositeOperation = 'destination-in';
+  const g = m.createRadialGradient(c[0], c[1] - 40, 330, c[0], c[1] - 40, 470);
+  g.addColorStop(0, '#000'); g.addColorStop(1, 'rgba(0,0,0,0)');
+  m.fillStyle = g; m.fillRect(0, 0, W, H);
+  return maskCanvas;
+}
+
+// Cue 4: the open heart cross-fades to the closed one. Running the wipe backwards leaves a flat lid across the top.
+const openCanvas = document.createElement('canvas');
+openCanvas.width = W; openCanvas.height = H;
+
+function draw(ctx, t) {
+  camera(t);
+  const s = heartState(t);
+  const close = easeIO(seg(t, T.c4 - 0.1, T.c4 + 0.8));
+  heart.update(close < 1 ? s : { ...s, cutaway: 0 });
+  // The heart shrinks onto the small heart in the middle of the loop, and grows back out of it.
+  const shrink = Math.max(easeIO(seg(t, LOOP_IN[0], LOOP_IN[1])) * (1 - easeIO(seg(t, LOOP_OUT[0], LOOP_OUT[1]))), 0);
+  const ha = 1 - Math.min(seg(t, LOOP_IN[0] + 0.2, LOOP_IN[1]), 1 - seg(t, LOOP_OUT[0], LOOP_OUT[1] - 0.2));
+  const fading = close > 0 && close < 1;
+  if (ha > 0) {
+    stage.render(t);
+    if (fading) {
+      const o = openCanvas.getContext('2d');
+      o.clearRect(0, 0, W, H); o.drawImage(stage.canvas, 0, 0);
+      heart.update({ ...s, cutaway: 0 });
+      stage.render(t);
+    }
+    const c = [(scr('cutRa')[0] + scr('cutLv')[0]) / 2, (scr('cutRa')[1] + scr('cutLv')[1]) / 2];
+    const k = lerp(1, 0.62, shrink);
+    ctx.save(); ctx.globalAlpha = ha;
+    ctx.translate(lerp(c[0], CIRC.x, shrink), lerp(c[1], CIRC.y, shrink)); ctx.scale(k, k); ctx.translate(-c[0], -c[1]);
+    ctx.drawImage(shrink > 0 ? masked(c) : stage.canvas, 0, 0);
+    ctx.restore();
+    if (fading) { ctx.save(); ctx.globalAlpha = ha * (1 - close); ctx.drawImage(openCanvas, 0, 0); ctx.restore(); }
+  }
+  drawPumps(ctx, t);
+  drawLoop(ctx, t);
+  drawCycle(ctx, t);
+  drawOrder(ctx, t);
+}
+
+window.S02 = { T };
+setup(draw);
+</script>

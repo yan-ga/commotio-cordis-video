@@ -1,0 +1,6 @@
+node_modules/
+.venv/
+build/
+*.mp4
+.DS_Store
+__pycache__/

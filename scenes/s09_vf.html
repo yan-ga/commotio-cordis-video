@@ -1,0 +1,546 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>s09 vf</title>
+<script src="lib.js"></script>
+<script src="shared.js"></script>
+<script src="grid2d.js"></script>
+<script type="importmap">{"imports":{"three":"../node_modules/three/build/three.module.js","three/addons/":"../node_modules/three/examples/jsm/"}}</script>
+<script type="module">
+// Part 9, ventricular fibrillation (3D heart, 2D consequences). The real heart quivers with big spinning
+// electrical swirls. Beside it, two flat slices of the bottom chamber compare cells in sync (one even squeeze,
+// blood out) with cells out of sync (each bit twitches alone, nothing out). No blood reaches the brain, its
+// oxygen drains, the person collapses, and a clock: fatal within minutes without help.
+import * as THREE from 'three';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { loadHeart, createStage } from './heart3d.js';
+const G = window.G2;
+const TAU = Math.PI * 2;
+const V = (x, y, z) => new THREE.Vector3(x, y, z);
+const ease = easeIO;
+
+const wt = wordAt;
+const T = {
+  c0: cs(0), billions: wt(0, 'Billions'), fire: wt(0, 'fire'), instead: wt(0, 'Instead'), squeezing: wt(0, 'squeezing'), quivers: wt(0, 'quivers'),
+  c1: cs(1), squeeze: wt(1, 'squeeze'), noBlood: wt(1, 'no blood'), blood: wt(1, 'blood'), brain: wt(1, 'The brain'), oxygen: wt(1, 'oxygen'), collapses: wt(1, 'collapses'), seconds: wt(1, 'within seconds'),
+  c2: cs(2), without: wt(2, 'Without'), fatal: wt(2, 'fatal'), minutes: wt(2, 'minutes'),
+};
+// Shot boundaries.
+const S = {
+  close: T.billions - 0.35,         // push in on the swirls
+  compare: T.instead - 0.35,        // pull back: heart on the left, squeeze vs quiver slices on the right
+  chain: T.brain - 0.35,            // heart -> brain -> person
+  clock: T.c2 - 0.45,               // fatal within minutes
+};
+
+// ================================================================ 3D: the quivering heart
+const stage = createStage({ bloom: 0.75 });
+// The quivering surface very occasionally yields one wildly over-bright (or NaN) pixel, which bloom smears into
+// a glowing square for a frame. Clearing non-finite pixels and capping the rest before bloom removes it; the
+// cap sits far above anything the lighting or the swirls produce.
+stage.composer.insertPass(new ShaderPass({
+  uniforms: { tDiffuse: { value: null } },
+  vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+  fragmentShader: `uniform sampler2D tDiffuse; varying vec2 vUv;
+    void main(){ vec4 c = texture2D(tDiffuse, vUv);
+      bool ok = !any(isnan(c)) && (abs(c.r) + abs(c.g) + abs(c.b) < 60000.0);
+      gl_FragColor = ok ? min(c, vec4(16.0)) : vec4(0.0, 0.0, 0.0, 1.0); }`,
+}), 1);
+const heartVF = await loadHeart(stage.renderer);
+stage.scene.add(heartVF.group);
+
+// ---------------------------------------------------------------- big spinning swirls
+// The toolkit's own rotors are thin lines that read as texture at a distance. These are a second skin on the
+// same mesh: the heart's own vertex displacement (taken from its material) keeps them glued to the quivering
+// wall, and each swirl is a thick, bright, two-armed spiral with a glowing trail that clearly turns.
+function heartVertexChunk(h) {
+  const sh = { uniforms: {}, vertexShader: '#include <common>\n#include <begin_vertex>', fragmentShader: '#include <common>' };
+  h.mesh.material.onBeforeCompile(sh);
+  return sh.vertexShader.split('vec3 transformed')[0];
+}
+const CORES = [
+  // anchor, offset along the wall (tangent, up), radius, spin direction, speed, phase
+  ['chestHit', [0.02, 0.06], 0.36, 1, 8.5, 0.0],
+  ['rvWall', [-0.06, 0.02], 0.33, -1, 9.5, 2.1],
+  ['apex', [0.02, 0.2], 0.3, -1, 10.5, 4.0],
+  ['lvLat', [0.0, 0.05], 0.34, 1, 9.0, 1.2],
+  ['rvBase', [0.04, 0.02], 0.28, 1, 10.0, 3.3],
+];
+function makeSwirls(h) {
+  const cp = [], ct = [], cb = [], cs4 = [];
+  for (const [name, [du, dv], R, dir, speed, ph] of CORES) {
+    const p = h.anchors[name].clone();
+    const n = (h.anchorNormals[name] || p.clone().normalize()).clone().normalize();
+    const t = V(0, 1, 0).addScaledVector(n, -n.y).normalize(), b = new THREE.Vector3().crossVectors(n, t);
+    p.addScaledVector(b, du).addScaledVector(t, dv);
+    cp.push(p); ct.push(b); cb.push(t); cs4.push(new THREE.Vector4(dir, R, speed, ph));
+  }
+  const N = CORES.length;
+  const mat = new THREE.ShaderMaterial({
+    uniforms: Object.assign({}, h.uniforms, {
+      uAmt: { value: 0 }, uT: { value: 0 }, uCP: { value: cp }, uCT: { value: ct }, uCB: { value: cb }, uCS: { value: cs4 },
+      cFront: { value: new THREE.Color('#ffeeb8') }, cTrail: { value: new THREE.Color('#ffa21f') },
+    }),
+    vertexShader: heartVertexChunk(h) + /* glsl */`
+      varying vec3 vR, vN; varying float vV;
+      void main() {
+        vec3 tr = position + heartDisplace(position, normal, aReg.zw) + normal * 0.004;
+        vR = position; vN = normal; vV = aReg.y;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(tr, 1.0);
+      }`,
+    fragmentShader: /* glsl */`
+      uniform float uAmt, uT; uniform vec3 uCP[${N}], uCT[${N}], uCB[${N}]; uniform vec4 uCS[${N}];
+      uniform vec3 cFront, cTrail;
+      varying vec3 vR, vN; varying float vV;
+      void main() {
+        float w = smoothstep(0.35, 0.8, vV) * uAmt;
+        // Vessel caps carry zero-length normals; a NaN here would bloom into a square.
+        if (!(w > 0.0) || dot(vN, vN) < 1e-8) discard;
+        vec3 nrm = normalize(vN);
+        float front = 0.0, trail = 0.0, eye = 0.0;
+        for (int i = 0; i < ${N}; i++) {
+          vec3 cn = normalize(cross(uCB[i], uCT[i]));   // the outward surface normal at the core
+          float facing = smoothstep(0.15, 0.55, dot(nrm, cn));
+          if (facing <= 0.0) continue;
+          float fi = float(i);
+          vec2 drift = 0.035 * vec2(sin(uT * (0.5 + 0.1 * fi) + fi * 2.1), sin(uT * (0.4 + 0.07 * fi) + fi * 1.3 + 0.8));
+          vec3 q = vR - uCP[i];
+          vec2 xy = vec2(dot(q, uCT[i]), dot(q, uCB[i])) - drift;
+          float rho = length(xy), R = uCS[i].y;
+          float env = (1.0 - smoothstep(R * 0.62, R, rho)) * facing;
+          if (env <= 0.0) continue;
+          // two arms winding out from the core, the whole pattern turning about it
+          float ph = 2.0 * uCS[i].x * atan(xy.y, xy.x) + 22.0 * rho - uT * uCS[i].z + uCS[i].w;
+          float u = 1.0 - fract(ph / 6.28318);          // 0 right behind the bright front, growing behind it
+          float edge = smoothstep(0.0, 0.035, 1.0 - u);   // crisp leading edge
+          float core = smoothstep(0.0, 0.05, rho);
+          front = max(front, exp(-u * u / 0.0036) * edge * env * core);
+          trail = max(trail, exp(-u / 0.16) * edge * env * core);
+          eye = max(eye, exp(-rho * rho / 0.0006) * facing);
+        }
+        vec3 col = (cFront * front * 2.3 + cTrail * trail * 0.22 + cFront * eye * 1.2) * w;
+        gl_FragColor = vec4(col, 1.0);
+      }`,
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+  });
+  const m = new THREE.Mesh(h.mesh.geometry, mat);
+  m.frustumCulled = false; m.renderOrder = 5;
+  h.group.add(m);
+  return mat;
+}
+const swirls = makeSwirls(heartVF);
+
+// ================================================================ timeline of the 3D shots
+const mix3 = (a, b, p) => a.map((v, i) => lerp(v, b[i], p));
+// Camera keys: [time, target, yaw, pitch, distance]. Moving the target left puts the heart right of centre.
+const CHAIN_CAM = [2.35, -0.26, 0];
+const CAM = [
+  [0, [-0.62, -0.08, 0], -8, 4, 5.4],               // title shot: heart right of centre, words on the left
+  [S.close, [-0.6, -0.08, 0], -7, 4, 5.2],
+  [S.close + 1.0, [-0.42, -0.26, 0.2], 4, 1, 3.85],    // close on the swirling ventricles, still right of centre
+  [S.compare - 0.05, [-0.41, -0.26, 0.2], 7, 1, 3.7],
+  [S.compare + 1.0, CHAIN_CAM, 2, 3, 7.5],           // heart on the left, for the slices and then the chain
+  [TIMING.duration, CHAIN_CAM, 6, 3, 7.3],
+];
+function camAt(t) {
+  let k = 0;
+  while (k < CAM.length - 2 && t > CAM[k + 1][0]) k++;
+  const [t0, a0, y0, p0, d0] = CAM[k], [t1, a1, y1, p1, d1] = CAM[k + 1];
+  const p = ease(seg(t, t0, t1));
+  return { target: V(...mix3(a0, a1, p)), yaw: lerp(y0, y1, p), pitch: lerp(p0, p1, p), dist: lerp(d0, d1, p) };
+}
+
+function render3D(t) {
+  const c = camAt(t);
+  // A slow hand-held drift keeps the frame alive without moving anything the eye is reading.
+  stage.orbit(c.yaw + 1.2 * Math.sin(t * 0.37), c.pitch + 0.8 * Math.sin(t * 0.29 + 1), c.dist, c.target);
+  // The quivering heart: no squeeze, a chaotic shimmer and the big swirls.
+  heartVF.update({ t, quiver: 1, dim: 0.06 });
+  swirls.uniforms.uT.value = t;
+  // Smaller on screen, the swirls burn a little brighter so they still read at a glance.
+  swirls.uniforms.uAmt.value = lerp(1, 1.25, seg(c.dist, 3.3, 7.5));
+  stage.render(t);
+}
+
+// ================================================================ 2D helpers
+function heading(ctx, s, x, y, size, color, alpha, align = 'left') {
+  if (alpha <= 0) return;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.font = `800 ${size}px ${FONT}`; ctx.textAlign = align; ctx.textBaseline = 'middle';
+  ctx.shadowColor = 'rgba(0,0,0,0.55)'; ctx.shadowBlur = 18;
+  ctx.fillStyle = color; ctx.fillText(s, x, y);
+  ctx.restore();
+}
+const toPx = (h, p) => { const v = p.clone().applyMatrix4(h.group.matrixWorld).project(stage.camera); return [(v.x * 0.5 + 0.5) * W, (0.5 - v.y * 0.5) * H]; };
+const AORTA = V(0.04, 0.9, 0.08);   // top of the aortic arch, where pumped blood leaves
+
+// Thick curved arrow from a to b bending by `bend` (pixels, to the left of travel). fill 0..1 draws it out.
+// Returns the middle of the full shaft, for marks placed on it.
+function curvedArrow(ctx, a, b, bend, o = {}) {
+  const alpha = o.alpha ?? 1;
+  const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2, dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy);
+  const c = [mx - dy / L * bend, my + dx / L * bend];
+  const P = u => [(1 - u) * (1 - u) * a[0] + 2 * u * (1 - u) * c[0] + u * u * b[0], (1 - u) * (1 - u) * a[1] + 2 * u * (1 - u) * c[1] + u * u * b[1]];
+  if (alpha <= 0) return P(0.44);
+  const fill = o.fill ?? 1, width = o.width || 22, head = Math.max(26, width * 1.9);
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  if (o.dash) ctx.setLineDash(o.dash);
+  ctx.strokeStyle = o.color || '#fff'; ctx.lineWidth = width;
+  if (o.glow) { ctx.shadowColor = o.glow; ctx.shadowBlur = 24; }
+  const end = Math.max(0.001, fill * 0.88);
+  ctx.beginPath();
+  for (let k = 0; k <= 40; k++) { const p = P(end * k / 40); k ? ctx.lineTo(...p) : ctx.moveTo(...p); }
+  ctx.stroke();
+  ctx.setLineDash([]);
+  if (fill > 0.05 && o.head !== false) {
+    const tip = P(Math.min(1, end + 0.12)), back = P(end);
+    const ang = Math.atan2(tip[1] - back[1], tip[0] - back[0]);
+    ctx.fillStyle = o.color || '#fff'; ctx.strokeStyle = o.color || '#fff';
+    ctx.beginPath(); ctx.moveTo(tip[0], tip[1]);
+    ctx.lineTo(tip[0] - Math.cos(ang - 0.55) * head, tip[1] - Math.sin(ang - 0.55) * head);
+    ctx.lineTo(tip[0] - Math.cos(ang + 0.55) * head, tip[1] - Math.sin(ang + 0.55) * head); ctx.closePath();
+    if (o.dash) { ctx.lineWidth = 5; ctx.stroke(); } else ctx.fill();
+  }
+  ctx.restore();
+  return P(0.44);   // the middle of the drawn shaft
+}
+// ================================================================ cue 0: title, monitor, then the close-up
+const LEFT = 110;
+function drawTitle(ctx, t) {
+  // The name, then "billions of cells firing out of step" in the same place as the camera closes in.
+  const a = env(t, T.c0 + 0.1, S.close + 0.35, 0.5);
+  if (a > 0) {
+    const p = easeOut(seg(t, T.c0 + 0.1, T.c0 + 0.8));
+    heading(ctx, 'Ventricular', LEFT, 170 - 10 * (1 - p), 92, '#fff6f2', a);
+    heading(ctx, 'fibrillation', LEFT, 272 - 10 * (1 - p), 92, '#fff6f2', a);
+    // A thin rule under the title draws out, as in the opening title.
+    const rw = 560 * easeOut(seg(t, T.c0 + 0.4, T.c0 + 1.1));
+    ctx.save(); ctx.globalAlpha = a * 0.8;
+    const g = ctx.createLinearGradient(LEFT, 0, LEFT + rw, 0);
+    g.addColorStop(0, 'rgba(255,110,130,1)'); g.addColorStop(1, 'rgba(255,90,110,0)');
+    ctx.fillStyle = g; ctx.fillRect(LEFT, 336, rw, 4); ctx.restore();
+  }
+  const b = env(t, S.close + 0.3, S.compare + 0.25, 0.4);
+  heading(ctx, 'Billions of cells', LEFT, 170, 76, '#fff6f2', b * seg(t, T.billions - 0.1, T.billions + 0.3));
+  heading(ctx, 'firing out of step', LEFT, 262, 76, C.spark, b * seg(t, T.fire - 0.3, T.fire + 0.1));
+  // The heart monitor shows the chaos from the name until the comparison.
+  const ma = env(t, T.c0 + 0.7, S.compare + 0.25, 0.5);
+  if (ma > 0) {
+    const x = LEFT, y = 440, w = 660, h = 280;
+    text(ctx, 'Heart monitor', x + 6, y - 34, 34, '#8fe8b0', 'left', 700, ma);
+    drawECG(ctx, x, y, w, h, tt => ecgVF(tt, 3) * 1.3, t, 3.0, { alpha: ma, lo: -1.0, hi: 1.0, mode: 'scroll' });
+    ctx.save(); ctx.globalAlpha = ma; ctx.strokeStyle = C.locked; ctx.lineWidth = 5; roundRect(ctx, x - 3, y - 3, w + 6, h + 6, 24); ctx.stroke(); ctx.restore();
+    text(ctx, 'chaotic rhythm', x + w / 2, y + h + 46, 36, '#ff8a9a', 'center', 800, ma);
+  }
+}
+
+// ================================================================ cue 0/1: squeeze vs quiver, as flat slices
+// A slice across the bottom chamber: a horseshoe of muscle cells around the blood, open at the top where blood
+// leaves. contraction(k, t) is how hard slice k is squeezing (0..1); squeezing cells flash the firing yellow.
+const CH_PAD = 70, chamberCanvases = [];
+function chamber(ctx, cx, cy, R, contraction, t, alpha, slot, depth = 0.3) {
+  if (alpha <= 0) return;
+  const size = 2 * (R + CH_PAD);
+  if (!chamberCanvases[slot]) { const cv = document.createElement('canvas'); cv.width = cv.height = size; chamberCanvases[slot] = cv; }
+  const cv = chamberCanvases[slot], g = cv.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, size, size);
+  const o = size / 2, BAND = 38;
+  const N = 18, gapA = 0.5, a0 = -Math.PI / 2 + gapA, span = TAU - 2 * gapA;
+  const c = []; for (let k = 0; k < N; k++) c.push(clamp(contraction(k, t)));
+  // Radius at any angle: a smooth blend between slice centres.
+  const rAt = a => {
+    const f = clamp((a - a0) / span) * N - 0.5;
+    const k = Math.floor(f), u = f - k;
+    const c0 = c[clamp(k, 0, N - 1)], c1 = c[clamp(k + 1, 0, N - 1)];
+    return R * (1 - depth * lerp(c0, c1, u * u * (3 - 2 * u)));
+  };
+  const pt = (a, r) => [o + Math.cos(a) * r, o + Math.sin(a) * r];
+  g.beginPath();
+  for (let i = 0; i <= 72; i++) { const a = a0 + span * i / 72; g.lineTo(...pt(a, rAt(a) - BAND / 2 - 2)); }
+  g.closePath(); g.fillStyle = C.blood; g.fill();
+  g.strokeStyle = 'rgba(10,18,48,0.6)'; g.lineWidth = 3; g.stroke();
+  const col = k => rgbStr(mixRGB(hexRGB(C.muscle), _RGB.spark, c[k]));
+  for (let k = 0; k < N; k++) {
+    const b0 = a0 + span * k / N - 0.004, b1 = a0 + span * (k + 1) / N + 0.004;
+    g.beginPath();
+    for (let i = 0; i <= 8; i++) { const a = lerp(b0, b1, i / 8); g.lineTo(...pt(a, rAt(a) + BAND / 2)); }
+    for (let i = 8; i >= 0; i--) { const a = lerp(b0, b1, i / 8); g.lineTo(...pt(a, rAt(a) - BAND / 2)); }
+    g.closePath(); g.fillStyle = col(k); g.fill();
+  }
+  for (const [k, a] of [[0, a0], [N - 1, a0 + span]]) { g.fillStyle = col(k); g.beginPath(); g.arc(...pt(a, rAt(a)), BAND / 2, 0, TAU); g.fill(); }
+  // Thin dividers so each slice reads as a separate cell.
+  g.strokeStyle = 'rgba(10,18,48,0.45)'; g.lineWidth = 2;
+  for (let k = 1; k < N; k++) { const a = a0 + span * k / N; g.beginPath(); g.moveTo(...pt(a, rAt(a) - BAND / 2)); g.lineTo(...pt(a, rAt(a) + BAND / 2)); g.stroke(); }
+  for (let k = 0; k < N; k++) {
+    const am = a0 + span * (k + 0.5) / N;
+    if (c[k] > 0.4) glow(g, ...pt(am, rAt(am)), 40, C.spark, (c[k] - 0.4) * 0.7);
+  }
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.drawImage(cv, cx - o, cy - o); ctx.restore();
+}
+const BEAT = 1.4;
+// Phased so the first squeeze lands on "squeezing".
+const normalPhase = t => (((t - T.squeezing) % BEAT) + BEAT) % BEAT / BEAT;
+const squeeze = p => Math.pow(Math.sin(Math.PI * clamp(p / 0.42)), 2);
+// Out of sync: small patches of three cells fire and pinch on their own short rhythms, so the ring never
+// squeezes as a whole.
+const twitch = (k, t) => { const g = Math.floor(k / 3), P = 0.5 + 0.4 * rand(g + 7); return squeeze(((t / P + rand(g + 77)) % 1) * 0.9); };
+
+// The out-of-step slice sits next to the quivering heart it comes from; the healthy one is the reference.
+const CHAOS = [990, 490], SYNC = [1560, 490], RING = 150;
+// Faint dashed circle at the resting size, so a real squeeze visibly shrinks inside it and a quiver doesn't.
+function restOutline(ctx, c, alpha) {
+  if (alpha <= 0) return;
+  ctx.save(); ctx.globalAlpha *= alpha * 0.45; ctx.setLineDash([10, 12]);
+  ctx.strokeStyle = '#c8d2eb'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(c[0], c[1], RING + 19 + 8, 0, TAU); ctx.stroke(); ctx.restore();
+}
+function drawCompare(ctx, t) {
+  const a = env(t, S.compare + 0.5, S.chain + 0.1, 0.4);
+  if (a <= 0) return;
+  // Where the slice is taken: a dashed cut across this heart's bottom chambers, leading to its own slice.
+  const l = toPx(heartVF, heartVF.anchors.rvWall), r = toPx(heartVF, heartVF.anchors.lvLat);
+  const ext = 0.06, cutA = [l[0] - (r[0] - l[0]) * ext, l[1] - (r[1] - l[1]) * ext], cutB = [r[0] + (r[0] - l[0]) * ext, r[1] + (r[1] - l[1]) * ext];
+  ctx.save(); ctx.globalAlpha = a * 0.9; ctx.setLineDash([16, 12]); ctx.lineCap = 'round';
+  ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 5; ctx.shadowColor = 'rgba(0,0,0,0.6)'; ctx.shadowBlur = 10;
+  ctx.beginPath(); ctx.moveTo(...cutA); ctx.lineTo(...cutB); ctx.stroke();
+  ctx.globalAlpha = a * 0.35; ctx.lineWidth = 3; ctx.setLineDash([6, 12]);
+  ctx.beginPath(); ctx.moveTo(cutB[0] + 20, cutB[1]); ctx.lineTo(CHAOS[0] - RING - 40, CHAOS[1]); ctx.stroke();
+  ctx.restore();
+  heading(ctx, 'The bottom chamber, sliced across', (SYNC[0] + CHAOS[0]) / 2, 125, 40, C.dim, a, 'center');
+  heading(ctx, 'This heart: out of step', CHAOS[0], 200, 46, '#ff8a9a', a, 'center');
+  heading(ctx, 'Healthy: in step', SYNC[0], 200, 46, '#9fe8ff', a, 'center');
+  restOutline(ctx, SYNC, a); restOutline(ctx, CHAOS, a);
+  const p = normalPhase(t);
+  chamber(ctx, SYNC[0], SYNC[1], RING, () => squeeze(p), t, a, 0);
+  chamber(ctx, CHAOS[0], CHAOS[1], RING, (k, tt) => 0.9 * twitch(k, tt), t, a, 1, 0.2);
+  text(ctx, 'blood', SYNC[0], SYNC[1] + 10, 32, 'rgba(255,255,255,0.85)', 'center', 700, a);
+  text(ctx, 'blood', CHAOS[0], CHAOS[1] + 10, 32, 'rgba(255,255,255,0.85)', 'center', 700, a);
+  // Each real squeeze pushes a bold jet of blood out of the top. Nothing ever leaves the quivering one.
+  for (let k = 0; k < 8; k++) {
+    const u = seg(p, 0.04 + k * 0.03, 0.46 + k * 0.03);
+    if (u <= 0 || u >= 1) continue;
+    const y = SYNC[1] - RING * 0.72 - easeOut(u) * 120, x = SYNC[0] + (rand(k + 3) - 0.5) * 36;
+    ctx.save(); ctx.globalAlpha = a * (1 - u * u);
+    ctx.fillStyle = C.blood; ctx.shadowColor = 'rgba(255,80,100,0.6)'; ctx.shadowBlur = 14;
+    ctx.beginPath(); ctx.arc(x, y, 18 - 6 * u, 0, TAU); ctx.fill(); ctx.restore();
+  }
+  // The tag lights up with each jet and dims while the chamber refills.
+  const jet = seg(p, 0.04, 0.16) * (1 - seg(p, 0.5, 0.7));
+  G.tag(ctx, 'blood out', SYNC[0] + 175, SYNC[1] - RING - 40, { size: 32, color: '#ffb3bf', alpha: a * seg(t, T.squeezing - 0.1, T.squeezing + 0.3) * (0.4 + 0.6 * jet) });
+  const sa = seg(t, T.squeezing - 0.1, T.squeezing + 0.3);
+  stamp(ctx, SYNC[0] - 110, 760, 64, 'tick', { alpha: a, pop: sa, label: 'Squeeze' });
+  // "Just quivers", then on "no blood" the same spot says so outright. One leaves before the other arrives.
+  const out = seg(t, T.noBlood - 0.45, T.noBlood - 0.2), em = seg(t, T.noBlood - 0.15, T.noBlood + 0.15);
+  stamp(ctx, CHAOS[0] - 140, 760, 64, 'cross', { alpha: a * (1 - out), pop: seg(t, T.quivers - 0.1, T.quivers + 0.3), label: 'Just quivers' });
+  stamp(ctx, CHAOS[0] - 160, 760, 64, 'cross', { alpha: a * em, pop: em, label: 'No blood out' });
+}
+
+// ================================================================ cue 1: brain, oxygen, collapse
+const BRAIN = { x: 930, y: 430, s: 1.12 };
+const PERSON = { x: 1330, y: 740 };
+const ROW_Y = 830;   // the line of words under the three pictures
+// Side view of a brain, facing left, about 320 x 250 px at s = 1.
+function brainPath() {
+  const p = new Path2D();
+  p.moveTo(-150, 20);
+  p.bezierCurveTo(-172, -60, -112, -128, -30, -120);
+  p.bezierCurveTo(30, -142, 122, -122, 152, -55);
+  p.bezierCurveTo(182, 0, 162, 62, 110, 72);
+  p.bezierCurveTo(80, 100, 20, 96, -20, 82);
+  p.bezierCurveTo(-82, 96, -142, 76, -150, 20);
+  p.closePath();
+  return p;
+}
+const BRAIN_PATH = brainPath();
+const GYRI = [
+  [[-122, 0], [-95, -40], [-60, -20], [-40, -70]], [[-70, -97], [-30, -72], [10, -102], [40, -72]],
+  [[30, -112], [55, -72], [95, -97], [122, -52]], [[-102, 45], [-62, 20], [-20, 56], [20, 26]],
+  [[0, -30], [30, -5], [70, -36], [112, 0]], [[40, 42], [70, 16], [100, 52], [142, 22]], [[-60, -55], [-25, -35], [0, -50], [10, -10]],
+];
+function drawBrain(ctx, x, y, s, oxy, alpha) {
+  if (alpha <= 0) return;
+  // Healthy pink drains to a cold grey as the oxygen runs out.
+  const k = clamp(oxy);
+  const mixc = c1 => `rgb(${c1.map((v, i) => Math.round(lerp([112, 118, 140][i], v, k))).join(',')})`;
+  const fill = mixc([244, 160, 178]), line = mixc([186, 86, 112]);
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.translate(x, y); ctx.scale(s, s);
+  // brainstem and cerebellum tucked under the back of the brain
+  ctx.fillStyle = mixc([206, 120, 142]);
+  ctx.save(); ctx.translate(48, 80); ctx.rotate(0.35); roundRect(ctx, -18, -10, 36, 96, 18); ctx.fill(); ctx.restore();
+  ctx.beginPath(); ctx.ellipse(104, 80, 54, 32, -0.25, 0, TAU); ctx.fill();
+  ctx.strokeStyle = line; ctx.lineWidth = 5; ctx.stroke();
+  ctx.fillStyle = fill; ctx.fill(BRAIN_PATH);
+  ctx.save(); ctx.clip(BRAIN_PATH);
+  const g = ctx.createLinearGradient(0, -130, 0, 100);
+  g.addColorStop(0, 'rgba(255,255,255,0.22)'); g.addColorStop(1, 'rgba(0,0,0,0.18)');
+  ctx.fillStyle = g; ctx.fillRect(-180, -150, 360, 260);
+  ctx.strokeStyle = line; ctx.lineWidth = 7; ctx.lineCap = 'round';
+  for (const [a, b, c, d] of GYRI) { ctx.beginPath(); ctx.moveTo(...a); ctx.bezierCurveTo(...b, ...c, ...d); ctx.stroke(); }
+  ctx.restore();
+  ctx.strokeStyle = line; ctx.lineWidth = 6; ctx.stroke(BRAIN_PATH);
+  ctx.restore();
+}
+function oxygenBar(ctx, x, y, w, h, frac, alpha) {
+  if (alpha <= 0) return;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.fillStyle = 'rgba(5,10,30,0.75)'; roundRect(ctx, x - 6, y - 6, w + 12, h + 12, (h + 12) / 2); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.lineWidth = 2; ctx.stroke();
+  const f = clamp(frac);
+  if (f > 0.005) {
+    const low = 1 - seg(f, 0.15, 0.5);
+    const col = `rgb(${Math.round(lerp(95, 255, low))},${Math.round(lerp(200, 84, low))},${Math.round(lerp(255, 102, low))})`;
+    ctx.fillStyle = col; ctx.shadowColor = col; ctx.shadowBlur = 16;
+    roundRect(ctx, x, y, Math.max(h, w * f), h, h / 2); ctx.fill();
+  }
+  ctx.restore();
+  text(ctx, 'Oxygen', x - 22, y + h / 2, 34, C.text, 'right', 700, alpha);
+}
+
+// A simple player made of rounded limbs. Joint angles are directions (0 = up, PI/2 = right, PI = down).
+const POSE = {
+  stand: { hip: 190, thigh: [Math.PI - 0.06, Math.PI + 0.06], shin: [Math.PI - 0.02, Math.PI + 0.02], arm: [Math.PI + 0.14, Math.PI - 0.14], fore: [Math.PI + 0.05, Math.PI - 0.05], head: 0 },
+  // knees give way and the head drops forward
+  buckle: { hip: 160, thigh: [Math.PI - 0.42, Math.PI - 0.3], shin: [Math.PI + 0.3, Math.PI + 0.38], arm: [Math.PI + 0.3, Math.PI + 0.05], fore: [Math.PI + 0.25, Math.PI], head: 0.35 },
+  // lying flat: legs nearly straight again, arms loose
+  lie: { hip: 186, thigh: [Math.PI - 0.12, Math.PI + 0.02], shin: [Math.PI + 0.1, Math.PI + 0.12], arm: [Math.PI - 0.15, Math.PI + 0.12], fore: [Math.PI - 0.05, Math.PI + 0.3], head: -0.15 },
+};
+const lerpPose = (A, B, p) => {
+  const o = {};
+  for (const k in A) o[k] = Array.isArray(A[k]) ? A[k].map((v, i) => lerp(v, B[k][i], p)) : lerp(A[k], B[k], p);
+  return o;
+};
+const dir = (a, l) => [Math.sin(a) * l, -Math.cos(a) * l];
+const add = (p, d) => [p[0] + d[0], p[1] + d[1]];
+// fall 0..1: the knees give way, then the whole body topples sideways about the feet and lands with a small settle.
+function person(ctx, x, y, fall, alpha) {
+  if (alpha <= 0) return;
+  const skin = '#f1d3bf', skinBack = '#d9b8a4', shirt = '#3f8fd8', shorts = '#1f2c55', hair = '#4a3326';
+  const q1 = ease(seg(fall, 0, 0.3)), q2 = seg(fall, 0.18, 0.82);
+  const land = seg(fall, 0.82, 1), settle = 0.05 * Math.sin(land * Math.PI) * (1 - land);
+  const P = lerpPose(lerpPose(POSE.stand, POSE.buckle, q1), POSE.lie, ease(q2));
+  const tip = (Math.PI / 2) * q2 * q2 - settle;   // gravity: slow start, fast finish
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.strokeStyle = 'rgba(255,255,255,0.22)'; ctx.lineWidth = 4; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x - 160, y + 2); ctx.lineTo(x + 440, y + 2); ctx.stroke();
+  const sx = x + 190 * Math.sin(tip), sh = ctx.createRadialGradient(sx, y, 10, sx, y, 150 + 110 * q2);
+  sh.addColorStop(0, 'rgba(0,0,0,0.35)'); sh.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = sh; ctx.fillRect(x - 160, y - 30, 600, 60);
+  // Pivot on the edge of the feet; lift by the body's half thickness as it lies down so it rests on the ground.
+  ctx.translate(x + 30 * Math.sin(tip), y - 36 * Math.sin(tip));
+  ctx.rotate(tip);
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  const hip = [0, -P.hip], shoulder = add(hip, [0, -150]), neck = add(shoulder, [0, -14]);
+  const limb = (from, a1, l1, a2, l2, w, col, end) => {
+    const mid = add(from, dir(a1, l1)), tp = add(mid, dir(a2, l2));
+    ctx.strokeStyle = col; ctx.lineWidth = w;
+    ctx.beginPath(); ctx.moveTo(...from); ctx.lineTo(...mid); ctx.lineTo(...tp); ctx.stroke();
+    end(tp, a2);
+  };
+  const shoe = (tp, a) => { ctx.fillStyle = '#e8ecf6'; ctx.save(); ctx.translate(...tp); ctx.rotate(a - Math.PI); ctx.beginPath(); ctx.ellipse(10, 4, 22, 12, 0, 0, TAU); ctx.fill(); ctx.restore(); };
+  const hand = tp => { ctx.fillStyle = skin; ctx.beginPath(); ctx.arc(tp[0], tp[1], 13, 0, TAU); ctx.fill(); };
+  // back limbs slightly darker for depth
+  limb(add(hip, [-10, 0]), P.thigh[1], 92, P.shin[1], 92, 30, skinBack, shoe);
+  limb(add(shoulder, [-30, 12]), P.arm[1], 72, P.fore[1], 68, 22, skinBack, hand);
+  // shorts and shirt
+  ctx.fillStyle = shorts; roundRect(ctx, -36, hip[1] - 30, 72, 70, 20); ctx.fill();
+  ctx.fillStyle = shirt; roundRect(ctx, -40, shoulder[1] - 12, 80, 150, 30); ctx.fill();
+  limb(add(hip, [10, 0]), P.thigh[0], 92, P.shin[0], 92, 32, skin, shoe);
+  // head drops forward as the knees go
+  ctx.strokeStyle = skin; ctx.lineWidth = 22; ctx.beginPath(); ctx.moveTo(...shoulder); ctx.lineTo(...neck); ctx.stroke();
+  const head = add(neck, dir(P.head, 40));
+  ctx.fillStyle = skin; ctx.beginPath(); ctx.arc(head[0], head[1], 38, 0, TAU); ctx.fill();
+  ctx.fillStyle = hair; ctx.beginPath(); ctx.arc(head[0], head[1], 39.5, Math.PI + P.head - 0.15, 2 * Math.PI + P.head + 0.15); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = shirt; ctx.lineWidth = 30; ctx.beginPath(); ctx.moveTo(...add(shoulder, [26, 14])); ctx.lineTo(...add(shoulder, [32, 40])); ctx.stroke();
+  limb(add(shoulder, [32, 30]), P.arm[0], 50, P.fore[0], 68, 22, skin, hand);
+  ctx.restore();
+}
+
+function drawChain(ctx, t) {
+  const a = env(t, S.chain + 0.05, S.clock + 0.25, 0.4);
+  // The heart's own labels land on their words while the slices are still up (they sit clear of them).
+  const ha = 1 - seg(t, S.clock - 0.15, S.clock + 0.25);
+  if (t < T.squeeze - 0.15 || ha <= 0) return;
+  const hx = toPx(heartVF, V(0, 0, 0))[0], top = toPx(heartVF, AORTA);
+  text(ctx, 'no squeeze', hx, ROW_Y, 40, C.text, 'center', 800, ha * seg(t, T.squeeze - 0.15, T.squeeze + 0.15));
+  // The pipe from the heart to the brain stays empty: no blood is arriving. It waits for the brain to come in.
+  const pStart = Math.max(T.blood, S.chain + 0.1);
+  const pa = ha * seg(t, pStart - 0.15, pStart + 0.25);
+  const from = [top[0] + 40, top[1] - 10], to = [BRAIN.x - 200, BRAIN.y - 10];
+  curvedArrow(ctx, from, to, -80, { alpha: pa * 0.8, color: 'rgba(200,210,235,0.75)', width: 8, dash: [14, 14] });
+  G.tag(ctx, 'no blood', (from[0] + to[0]) / 2, Math.min(from[1], to[1]) - 70, { size: 34, color: '#ffb3bf', alpha: pa });
+  // Brain and its draining oxygen.
+  const ba = a * seg(t, T.brain - 0.2, T.brain + 0.3);
+  const oxy = 1 - 0.94 * ease(seg(t, T.brain + 0.5, T.collapses - 0.3));
+  drawBrain(ctx, BRAIN.x, BRAIN.y, BRAIN.s, lerp(0.1, 1, oxy), ba);
+  heading(ctx, 'Brain', BRAIN.x, BRAIN.y - 200, 46, C.text, ba, 'center');
+  oxygenBar(ctx, BRAIN.x - 110, BRAIN.y + 190, 280, 34, oxy, ba);
+  text(ctx, 'starved of oxygen', BRAIN.x, ROW_Y, 40, '#ff8a9a', 'center', 800, a * seg(t, T.oxygen - 0.4, T.oxygen + 0.1));
+  // The person collapses.
+  const fa = a * seg(t, T.collapses - 0.9, T.collapses - 0.5);
+  person(ctx, PERSON.x, PERSON.y, seg(t, T.collapses - 0.05, T.collapses + 0.85), fa);
+  text(ctx, 'collapses', PERSON.x + 200, ROW_Y, 40, C.text, 'center', 800, fa * seg(t, T.collapses + 0.1, T.collapses + 0.5));
+  text(ctx, 'within seconds', PERSON.x + 200, ROW_Y + 56, 40, '#ff8a9a', 'center', 800, fa * seg(t, T.seconds - 0.15, T.seconds + 0.3));
+}
+
+// ================================================================ cue 2: the clock
+function drawClock(ctx, t) {
+  const a = env(t, S.clock + 0.35, TIMING.duration + 1, 0.5);
+  if (a <= 0) return;
+  const x = 900, y = 470, r = 230;
+  ctx.save(); ctx.globalAlpha *= a;
+  ctx.fillStyle = 'rgba(8,14,40,0.9)'; ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill();
+  // red sector: the minutes running out
+  const frac = 0.03 + 0.92 * ease(seg(t, T.c2 + 0.1, TIMING.duration - 0.5));
+  const rg = ctx.createRadialGradient(x, y, 0, x, y, r);
+  rg.addColorStop(0, 'rgba(255,84,102,0.3)'); rg.addColorStop(1, 'rgba(255,84,102,0.75)');
+  ctx.fillStyle = rg; ctx.beginPath(); ctx.moveTo(x, y); ctx.arc(x, y, r * 0.88, -Math.PI / 2, -Math.PI / 2 + TAU * frac); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = '#e9eef8'; ctx.lineWidth = 16; ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.stroke();
+  // crown and side button: a stopwatch
+  ctx.fillStyle = '#e9eef8'; roundRect(ctx, x - 34, y - r - 56, 68, 34, 10); ctx.fill();
+  ctx.fillRect(x - 12, y - r - 26, 24, 22);
+  ctx.save(); ctx.translate(x, y); ctx.rotate(0.75); roundRect(ctx, -14, -r - 44, 28, 34, 8); ctx.fill(); ctx.restore();
+  ctx.lineCap = 'round';
+  for (let k = 0; k < 60; k++) {
+    const an = k / 60 * TAU, big = k % 5 === 0;
+    ctx.lineWidth = big ? 8 : 3; ctx.strokeStyle = big ? '#e9eef8' : 'rgba(233,238,248,0.5)';
+    ctx.beginPath(); ctx.moveTo(x + Math.cos(an) * r * (big ? 0.74 : 0.82), y + Math.sin(an) * r * (big ? 0.74 : 0.82));
+    ctx.lineTo(x + Math.cos(an) * r * 0.9, y + Math.sin(an) * r * 0.9); ctx.stroke();
+  }
+  // Minute labels on every other big tick: one turn of the dial is 12 minutes, so "minutes" has a scale.
+  ctx.font = `800 40px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#e9eef8'; ctx.shadowColor = 'rgba(0,0,0,0.6)'; ctx.shadowBlur = 8;
+  for (let m = 0; m < 12; m += 2) {
+    const an = -Math.PI / 2 + m / 12 * TAU;
+    ctx.fillText(String(m), x + Math.cos(an) * r * 0.57, y + Math.sin(an) * r * 0.57 + 2);
+  }
+  ctx.font = `700 30px ${FONT}`; ctx.fillStyle = 'rgba(233,238,248,0.8)';
+  ctx.fillText('min', x, y + r * 0.3);
+  ctx.shadowBlur = 0;
+  const ha = -Math.PI / 2 + TAU * frac;
+  ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 12;
+  ctx.beginPath(); ctx.moveTo(x - Math.cos(ha) * 30, y - Math.sin(ha) * 30); ctx.lineTo(x + Math.cos(ha) * r * 0.78, y + Math.sin(ha) * r * 0.78); ctx.stroke();
+  ctx.fillStyle = '#ffffff'; ctx.beginPath(); ctx.arc(x, y, 18, 0, TAU); ctx.fill();
+  ctx.restore();
+  const tx = 1220;
+  heading(ctx, 'Without help,', tx, 370, 60, C.text, a * seg(t, T.without - 0.2, T.without + 0.2));
+  heading(ctx, 'fatal within', tx, 480, 76, '#ff6b7d', a * seg(t, T.fatal - 0.2, T.fatal + 0.3));
+  heading(ctx, 'minutes', tx, 568, 76, '#ff6b7d', a * seg(t, T.minutes - 0.2, T.minutes + 0.3));
+  // What "help" means, leading into the next part (the AED scene).
+  const helpA = a * seg(t, T.minutes + 0.3, T.minutes + 0.7);
+  ctx.save(); ctx.font = `700 44px ${FONT}`; const hw = ctx.measureText('help = CPR + AED').width + 44 * 0.9; ctx.restore();
+  G.tag(ctx, 'help = CPR + AED', tx + hw / 2, 690 + 12 * (1 - helpA), { size: 44, color: '#8fe8b0', alpha: helpA });
+}
+
+// ================================================================ main
+function draw(ctx, t) {
+  render3D(t);
+  ctx.drawImage(stage.canvas, 0, 0);
+  drawTitle(ctx, t);
+  drawCompare(ctx, t);
+  drawChain(ctx, t);
+  drawClock(ctx, t);
+}
+
+window.S09 = { T, S };
+setup(draw);
+</script>

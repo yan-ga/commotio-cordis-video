@@ -1,0 +1,142 @@
+{
+  "title": "The Split Second: How a Blow to the Chest Can Stop a Heart",
+  "voice": "bm_fable",
+  "speed": 1.0,
+  "pronounce": {
+    "commotio cordis": "[commotio](/kəmˈəʊʃiəʊ/) [cordis](/kˈɔːdɪs/)",
+    "AEDs": "[AEDs](/ˌeɪiːdˈiːz/)",
+    "AED": "[AED](/ˌeɪiːdˈiː/)",
+    "ECG": "[ECG](/ˌiːsiːdʒˈiː/)",
+    "CPR": "[CPR](/ˌsiːpiːˈɑː/)",
+    "AV node": "[AV](/ˌeɪvˈiː/) node"
+  },
+  "scenes": [
+    {
+      "id": "s01_hook",
+      "title": "A blow that stops a heart",
+      "cues": [
+        {
+          "text": "A cricket ball.",
+          "pause": 0.7
+        },
+        {
+          "text": "A knee.",
+          "pause": 0.7
+        },
+        {
+          "text": "An elbow, in a contest for the ball.",
+          "pause": 0.6
+        },
+        "A hit to the chest that doesn't break a rib, and doesn't hurt the heart at all.",
+        "And yet, very rarely, a perfectly healthy heart just stops pumping. Instantly.",
+        "It's called commotio cordis. Latin for commotion of the heart. It isn't an injury. It's an electrical fault.",
+        "So how can a hit scramble electricity? First, let's see how the heart's wiring works."
+      ]
+    },
+    {
+      "id": "s02_pump",
+      "title": "The pump",
+      "cues": [
+        "Your heart is two pumps, side by side. We're facing it, so its right side is on your left.",
+        "Each pump has a small chamber on top, the atrium, and a big muscly one below, the ventricle.",
+        "The right pump sends blood up to the lungs to pick up oxygen. It comes back to the left pump, which sends it all the way round the body, and back to the right pump again.",
+        "Most blood simply drops into the bottom chambers. The top ones give a little squeeze to top them up. The bottom ones do the real pumping.",
+        "But muscle can't decide when to squeeze on its own. Something has to give the order."
+      ]
+    },
+    {
+      "id": "s03_spark",
+      "title": "The spark",
+      "cues": [
+        "That order comes from a tiny patch in the right atrium, called the sinoatrial node. Your natural pacemaker. It fires sixty to a hundred times a minute, all by itself.",
+        "Zoom into one of its cells. Its skin is dotted with tiny doors that let charged particles in and out. Sodium, potassium and calcium. All three are positive.",
+        "Sodium and calcium crowd outside. Potassium crowds inside. And like a tiny battery, the cell keeps its inside negative.",
+        "Pacemaker cells have a leaky door. Sodium trickles in, and the inside slowly creeps up towards a tipping point.",
+        "Then calcium doors fling open, calcium rushes in, and the inside flips to positive. That flip is the cell firing. The spark.",
+        "Then potassium doors open, potassium flows out, and the inside drops back to negative. And the leak starts again. Creep, spark, reset.",
+        "Adrenaline speeds the leak up, so your heart beats faster. Calming nerves slow it down."
+      ]
+    },
+    {
+      "id": "s04_wiring",
+      "title": "The wiring",
+      "cues": [
+        "That spark has to reach billions of muscle cells. Heart cells are joined by tiny tunnels, so when one fires, positive charge leaks into its neighbours. Think of it as a knock.",
+        "Each knocked cell fires, and knocks the next, like dominoes. One spark becomes a wave.",
+        "The wave sweeps across the top chambers, and they squeeze.",
+        "Then it hits a layer that blocks the signal everywhere except one gateway, the AV node. It holds the signal back for a tenth of a second, so the top chambers can finish topping up.",
+        "Then it races down fast wiring, special cells built for speed, through the middle of the heart and around the bottom chambers.",
+        "The whole bottom of the heart fires within a tenth of a second, and squeezes as one."
+      ]
+    },
+    {
+      "id": "s05_muscle",
+      "title": "The muscle cell",
+      "cues": [
+        "Now zoom into a muscle cell down there. Unlike a pacemaker cell, it doesn't leak. It sits still, negative inside, waiting for a knock.",
+        "When the knock comes, its fast sodium doors fling open. Sodium floods in, and the cell fires.",
+        "Then calcium pours in. Calcium is the signal to squeeze. It unlocks the muscle strands, and tiny heads grab and pull, like rowers. Billions of tiny pulls make one heartbeat.",
+        "Then potassium pours out, the cell resets to negative, the calcium is pumped away, and the muscle relaxes.",
+        "So, sodium says go. Calcium says squeeze. Potassium says reset."
+      ]
+    },
+    {
+      "id": "s06_lockout",
+      "title": "The lockout",
+      "cues": [
+        "Now the most important part. Every sodium door has a lid. The moment the door opens, the lid swings shut and plugs it. The cell is locked. However hard you knock, it can't fire.",
+        "It only unlocks once the inside is back to negative. That takes about a quarter of a second. So a cell only fires when it's unlocked, and it gets a knock.",
+        "And that keeps every heartbeat safe. Each cell knocks both ways. But the cell behind it has only just fired, so it's still locked, and the knock is ignored. The wave can only go forwards.",
+        "It crosses the heart in a tenth of a second, but cells stay locked for a quarter of a second. So it reaches the far side with nothing left to fire, and dies.",
+        "But here's the catch. Cells fire at slightly different moments, and some reset faster than others. So they don't all unlock together."
+      ]
+    },
+    {
+      "id": "s07_window",
+      "title": "The vulnerable window",
+      "cues": [
+        "You can see this on an ECG, the heart trace on hospital monitors. The tall spike is the bottom chambers firing. The bump after it, the T wave, is them resetting.",
+        "Because some cells reset faster than others, partway up that bump the heart is a patchwork. Some cells are unlocked, and some right next to them are still locked.",
+        "That's the vulnerable window. It lasts just a few hundredths of a second, about one or two percent of each heartbeat.",
+        "And it's the moment when a blow to the chest becomes dangerous."
+      ]
+    },
+    {
+      "id": "s08_impact",
+      "title": "The split second",
+      "cues": [
+        "So what happens when a hit lands right then?",
+        "It squashes and stretches the muscle underneath. That pulls open special stretch doors, and positive charge pours in. A fake knock.",
+        "At any other moment, nothing much happens. If the cells are all locked, it's ignored. If they're all unlocked, you get one extra beat that dies like a normal one.",
+        "But in the window, the fake knock fires the cells under the hit. Some of their neighbours are still locked, so on that side, the knock is ignored. The wave can only escape the other way, so it goes around them.",
+        "By the time it gets back, those locked cells have unlocked. So it passes straight through them, and arrives back where it started.",
+        "And the start has unlocked too. So it fires again. And the wave goes round, and round. A wave chasing its own tail. This is called re-entry.",
+        "It spins faster than the pacemaker, so every normal beat crashes into it and fizzles out. Then the loop breaks into more and more spinning waves. Electrical tornadoes.",
+        "That's why it's so rare. The hit has to land right over the heart, with just the wrong force, inside that tiny window. It mostly happens to young people playing sport."
+      ]
+    },
+    {
+      "id": "s09_vf",
+      "title": "Ventricular fibrillation",
+      "cues": [
+        "This is ventricular fibrillation. Billions of cells fire out of step. Instead of squeezing, the heart just quivers.",
+        "No squeeze, no blood pumped. The brain is starved of oxygen, and the person collapses within seconds.",
+        "Without help, it's fatal within minutes."
+      ]
+    },
+    {
+      "id": "s10_aed",
+      "title": "The reset button",
+      "cues": [
+        "The fix is a strong electric shock from a defibrillator. The ones in green boxes at sports grounds and gyms are called AEDs. Anyone can use one. It talks you through it.",
+        "But if a knock caused this, why does a bigger knock fix it?",
+        "The hit only fired one small spot, with ready cells all around it, so the wave had room to run.",
+        "The shock fires every cell in the heart at the same instant. Now every cell is locked at once, so the spinning waves have nowhere to go, and they die out.",
+        "The cells unlock together, and the pacemaker's next spark sends one clean wave. The heart beats again.",
+        "It's often weak at first, so the AED tells you to keep doing CPR, pushing hard and fast on the chest, until it recovers.",
+        "A shock only clears chaos. After it, the pacemaker has to take over. If the heart has gone completely quiet, a flatline, there's nothing to take over. So the AED checks first, and won't shock a flatline.",
+        "With commotio cordis, the heart itself is healthy. Shocked fast enough, it can beat again. Every minute without a shock cuts the chance of survival by roughly seven to ten percent."
+      ]
+    }
+  ]
+}

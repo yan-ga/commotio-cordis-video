@@ -1,0 +1,775 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>s03 spark</title>
+<script src="lib.js"></script>
+<script src="shared.js"></script>
+<script src="grid2d.js"></script>
+<script type="importmap">{"imports":{"three":"../node_modules/three/build/three.module.js","three/addons/":"../node_modules/three/examples/jsm/"}}</script>
+<script type="module">
+// Part 3, the spark. 3D: the real heart, the sinoatrial node pulsing in the right atrium, then one push
+// into the node, a cluster of pacemaker cells, one cell and its skin with doors and ions. The skin
+// flattens into a clean 2D membrane strip: the cell as a tiny battery, then one slow narrated beat
+// (leak creep, calcium spark, potassium reset) drawn on a voltage graph that clears every cycle, the
+// automatic loop, and three stacked traces for adrenaline and calming nerves.
+import * as L3 from './lib3d.js';
+import { loadHeart, createStage as createHeartStage, beat } from './heart3d.js';
+const { THREE } = L3;
+const G = window.G2;
+const TAU = Math.PI * 2;
+
+// Word onsets measured from the narration audio, as offsets into each cue.
+const w = (i, dt) => cs(i) + dt;
+const T = {
+  ra: w(0, 1.95), sa: w(0, 3.2), pacemaker: w(0, 5.17), rate: w(0, 6.54), itself: w(0, 8.23),
+  zoom: w(1, 0.32), cells: w(1, 1.12), skin: w(1, 2.18), doors: w(1, 3.45), charged: w(1, 4.14),
+  na: w(1, 5.92), k: w(1, 6.55), ca: w(1, 7.25), positive: w(1, 8.0),
+  crowdOut: w(2, 0.3), crowdIn: w(2, 2.36), battery: w(2, 4.78), negative: w(2, 6.55),
+  leaky: w(3, 1.43), trickle: w(3, 2.43), creeps: w(3, 4.8), tipping: w(3, 5.62),
+  fling: w(4, 1.2), rushes: w(4, 2.45), flips: w(4, 3.86), firing: w(4, 6.31), spark: w(4, 7.21),
+  kOpen: w(5, 0.38), flows: w(5, 2.2), drops: w(5, 3.48), again: w(5, 5.25),
+  wCreep: w(5, 6.56), wSpark: w(5, 6.96), wReset: w(5, 7.5),
+  adrenaline: w(6, 0.27), faster: w(6, 2.73), calming: w(6, 3.59), slow: w(6, 4.26),
+};
+// Shot changes.
+const S = {
+  dive: T.zoom - 0.1,           // fast push into the node
+  cells: T.zoom + 0.55,         // dissolve to the cluster of pacemaker cells
+  mem: T.skin - 0.15,           // dissolve to the cell skin
+  flat0: T.positive + 0.75,     // the skin starts to flatten
+  flat1: T.positive + 2.05,
+  to2D: T.positive + 1.75,      // cross-fade to the 2D strip
+  end2D: cs(6) - 0.35,          // membrane and graph leave for the stacked traces
+};
+
+// ================================================================ 3D heart (heart3d)
+const hStage = createHeartStage();
+const heart = await loadHeart(hStage.renderer);
+hStage.scene.add(heart.group);
+
+// The node fires on a steady rhythm (about 67 a minute) and each fire starts a heartbeat.
+const SA_T0 = 0.35, SA_P = 0.9;
+const saPhase = t => Math.max(0, t - SA_T0) / SA_P;
+const saPulse = t => (t < SA_T0 ? 0 : Math.exp(-((t - SA_T0) % SA_P) / 0.16));
+
+const SA = heart.world('sa');
+const BASE_T = new THREE.Vector3(0, -0.05, 0);
+// Camera: front view, then a slow push towards the node, which sits left of centre so the words have room.
+function heartCam(t) {
+  const a = L3.ease(seg(t, T.ra - 0.6, T.sa + 0.6));
+  const b = L3.ease(seg(t, T.sa + 0.6, S.dive));
+  const d = L3.ease(Math.pow(seg(t, S.dive, S.cells + 0.1), 1.6));
+  const yaw = lerp(lerp(0, -16, a), -20, b);
+  const pitch = lerp(4, 7, a);
+  let dist = lerp(lerp(4.9, 3.9, a), 3.45, b);
+  dist = lerp(dist, 0.32, d);
+  const y = yaw * Math.PI / 180;
+  const right = new THREE.Vector3(Math.cos(y), 0, -Math.sin(y));
+  const onNode = SA.clone().addScaledVector(right, 0.42 * (1 - d)).add(new THREE.Vector3(0, -0.12 * (1 - d), 0));
+  const target = BASE_T.clone().lerp(onNode, Math.max(lerp(0, 0.55, a), b, d));
+  hStage.orbit(yaw, pitch, dist, target);
+}
+function heartFrame(ctx, t, alpha) {
+  heartCam(t);
+  const ph = saPhase(t);
+  const raHi = env(t, T.ra - 0.1, T.sa + 0.1, 0.35);
+  const saOn = seg(t, T.sa - 0.2, T.sa + 0.3);
+  heart.update({
+    t, ...beat(ph % 1),
+    highlight: raHi > 0 ? { ra: 0.5 * raHi } : { patch: saOn * (0.5 + 0.9 * saPulse(t)) },
+    highlightColor: raHi > 0 ? '#cfe4ff' : '#fff0b8',
+    patch: { at: 'sa', radius: 0.09 },
+  });
+  hStage.render(t);
+  ctx.save(); ctx.globalAlpha = alpha; ctx.drawImage(hStage.canvas, 0, 0); ctx.restore();
+  return { sa: heart.screen('sa', hStage.camera), ra: heart.screen('ra', hStage.camera), saOn };
+}
+
+// ================================================================ 3D cells and membrane (lib3d)
+const stage = L3.createStage({ bloom: true, dof: { aperture: 0.0014, maxblur: 0.006 } });
+const S3 = stage.scene;
+
+const clusterG = new THREE.Group(); clusterG.position.set(100, 0, 0); S3.add(clusterG);
+const cluster = L3.createCellSheet({ cols: 5, rows: 4, length: 1.5, height: 0.85, gap: 0.08, vgap: 0.16, seed: 6 });
+clusterG.add(cluster.group);
+const HERO = cluster.index(2, 2);
+const heroPos = () => clusterG.position.clone().add(new THREE.Vector3(cluster.cells[HERO].x, cluster.cells[HERO].y, 0));
+
+// The skin patch. The three front doors sit on the cut edge and become the three 2D doors; the two at the
+// back only say "dotted with doors" and shrink away as the patch turns flat.
+const DOOR_X = { leak: -3.6, ca: 0.8, k: 5.2 };
+const memG = new THREE.Group(); memG.position.set(200, 0, 0); S3.add(memG);
+const memWrap = new THREE.Group(); memG.add(memWrap);
+const mem = L3.createMembrane({
+  width: 16, depth: 9, seed: 5,
+  doors: [
+    { kind: 'na', x: DOOR_X.leak, z: 3.7 }, { kind: 'ca', x: DOOR_X.ca, z: 3.7 }, { kind: 'k', x: DOOR_X.k, z: 3.7 },
+    { kind: 'k', x: -1.6, z: -1.8 }, { kind: 'ca', x: 3.3, z: -2.6 },
+  ],
+});
+memWrap.add(mem.group);
+const ION_R = 0.19;
+const ions3 = { na: L3.createIons('na', 40, { radius: ION_R }), k: L3.createIons('k', 40, { radius: ION_R }), ca: L3.createIons('ca', 30, { radius: ION_R }) };
+for (const k in ions3) memWrap.add(ions3[k].group);
+
+// Where each kind of charge waits: sodium and calcium crowd outside (+Y), potassium inside (-Y).
+const OUT_BOX = { min: [-7.5, 1.55, -4], max: [7.5, 3.45, 4.3] };
+const IN_BOX = { min: [-7.5, -3.45, -4], max: [7.5, -1.55, 4.3] };
+const CLOUD = { na: [11, 22, OUT_BOX], ca: [12, 12, OUT_BOX], k: [13, 22, IN_BOX] };
+const cloud = (kind, t) => { const [seed, n, box] = CLOUD[kind]; return L3.ionCloud(seed, n, box, t, 0.22); };
+
+// The flat 2D strip the skin turns into: membrane-local (x, y) -> frame pixels.
+// Centred and large while the cell is the only thing on screen, then it slides left to make room for the graph.
+const M2 = { cx: 960, cy: 580, ppu: 78, k: 1.2 };
+const M2_SLIDE = [cs(3) - 0.45, cs(3) + 0.45];
+function setM2(t) {
+  const q = easeIO(seg(t, M2_SLIDE[0], M2_SLIDE[1]));
+  M2.cx = lerp(960, 600, q); M2.cy = lerp(580, 580, q); M2.ppu = lerp(78, 66, q); M2.k = M2.ppu / 65;
+}
+const mx = x => M2.cx + M2.ppu * x, my = y => M2.cy - M2.ppu * y;
+
+function clusterShot(t) {
+  memG.visible = false; clusterG.visible = true;
+  // The whole cluster flashes with each fire of the node, spreading out from the cell in the middle.
+  cluster.cells.forEach((c, i) => {
+    const h = cluster.cells[HERO];
+    const delay = 0.07 * Math.hypot(c.x - h.x, (c.y - h.y) * 1.6);
+    const tt = t - delay;
+    // A short, strong flash that blooms, so it reads as a spark rather than a pale cell.
+    const f = tt < SA_T0 ? 0 : Math.exp(-((tt - SA_T0) % SA_P) / 0.06);
+    cluster.setCell(i, { fire: 0.95 * f });
+  });
+  cluster.discs.forEach((_, i) => cluster.setDisc(i, 0));
+  const q = L3.ease(seg(t, S.cells - 0.1, S.mem + 0.15));
+  const hp = heroPos();
+  const from = { pos: [100 + 0.6, 0.9, 9.5], target: [100, 0, 0] };
+  const to = { pos: [hp.x + 0.25, hp.y + 0.3, 3.0], target: [hp.x, hp.y, 0.2] };
+  const pos = new THREE.Vector3(...from.pos.map((v, k) => lerp(v, to.pos[k], q)));
+  const tg = new THREE.Vector3(...from.target.map((v, k) => lerp(v, to.target[k], q)));
+  stage.setCamera({ pos, target: tg, fov: 34 });
+  stage.focusOn(new THREE.Vector3(hp.x, hp.y, 0.3));
+}
+
+// One ion's trip through a door: from the bulk on one side, down the pore, into the bulk on the other.
+function memShot(t) {
+  memG.visible = true; clusterG.visible = false;
+  const fp = seg(t, S.flat0, S.flat1);
+  mem.update(t, { wave: 1 - L3.ease(fp) });
+  const [dLeak, dCa, dK, b1, b2] = mem.doors;
+  // "Doors that let charged particles in and out": each door swings open for its own few ions.
+  const pass = (a, b) => env(t, a, b, 0.35);
+  dLeak.set({ open: 0.15 + 0.6 * pass(T.charged - 0.3, T.charged + 1.9) });
+  dCa.set({ open: 0.1 + 0.7 * pass(T.charged + 0.1, T.charged + 2.3) });
+  dK.set({ open: 0.1 + 0.7 * pass(T.charged + 0.4, T.charged + 2.6) });
+  b1.set({ open: 0.1 }); b2.set({ open: 0.1 });
+  const shrink = 1 - L3.ease(seg(fp, 0.05, 0.45));
+  for (const d of [b1, b2]) d.group.scale.setScalar(Math.max(1e-3, shrink));
+  for (const d of [dLeak, dCa, dK]) d.group.scale.setScalar(1);
+
+  // Camera first: the flatten is computed against this frame's camera.
+  const lt = Math.min(t, S.flat0) - S.mem;
+  const tg = new THREE.Vector3(200, -0.3, 2.8);
+  stage.setCamera({ pos: new THREE.Vector3(200 + 0.5 - lt * 0.08, 3.6 - lt * 0.05, 17.6 - lt * 0.16), target: tg, fov: 34 });
+  stage.focusOn(new THREE.Vector3(200, 0, 3.7));
+  L3.flatten(memWrap, stage, fp, { center: [M2.cx, M2.cy], pxPerUnit: M2.ppu, thin: 0.02 });
+
+  // Named ions swell for a moment as the voice says each one.
+  const named = { na: T.na, k: T.k, ca: T.ca };
+  const all = env(t, T.positive - 0.05, T.positive + 1.2, 0.25);
+  for (const kind of ['na', 'k', 'ca']) {
+    const I = ions3[kind];
+    const pop = 1 + 0.45 * Math.max(env(t, named[kind] - 0.05, named[kind] + 0.9, 0.2), all * 0.7);
+    let n = 0;
+    for (const v of cloud(kind, t)) I.set(n++, v, pop);
+    // A few ions use the doors: sodium and calcium in, potassium out.
+    const door = { na: dLeak, ca: dCa, k: dK }[kind], dir = kind === 'k' ? 'out' : 'in';
+    const t0 = T.charged + { na: -0.1, ca: 0.3, k: 0.6 }[kind];
+    for (let i = 0; i < 4; i++) {
+      const p = (t - t0 - i * 0.38) / 1.5;
+      if (p > 0 && p < 1) I.set(n++, memWrap.worldToLocal(door.path(p, i + 7, dir)), pop);
+    }
+    I.hideFrom(n); I.commit();
+  }
+  return fp;
+}
+
+// ================================================================ 2D drawing kit for this scene
+const DOOR_COL = { leak: '#c9973c', ca: '#3f9c79', k: '#8a62c4' };
+const ION_OF = { leak: 'na', ca: 'ca', k: 'k' };
+const DOOR_NAME = { leak: 'leaky door', ca: 'calcium door', k: 'potassium door' };
+
+function title(ctx, s, alpha) { text(ctx, s, 80, 88, 50, C.text, 'left', 700, alpha); }
+
+// Flat lipid bilayer matching the flattened 3D patch (heads every 0.3 units, 1.12 units apart).
+function membrane2D(ctx, alpha, flashA = 0) {
+  if (alpha <= 0) return;
+  const x0 = mx(-8), x1 = mx(8), y = M2.cy, half = 0.56 * M2.ppu, sp = 0.3 * M2.ppu;
+  const gaps = Object.values(DOOR_X).map(mx);
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.fillStyle = 'rgba(255,214,160,0.10)'; ctx.fillRect(x0, y - half, x1 - x0, half * 2);
+  for (let x = x0 + sp / 2; x < x1; x += sp) {
+    if (gaps.some(g => Math.abs(x - g) < 56 * M2.k)) continue;
+    ctx.strokeStyle = 'rgba(255,226,190,0.55)'; ctx.lineWidth = 2.5;
+    for (const s of [-1, 1]) {
+      ctx.beginPath();
+      ctx.moveTo(x - 3, y + s * (half - 8)); ctx.lineTo(x - 3, y + s * 4);
+      ctx.moveTo(x + 3, y + s * (half - 8)); ctx.lineTo(x + 3, y + s * 4); ctx.stroke();
+    }
+  }
+  for (let x = x0 + sp / 2; x < x1; x += sp) {
+    if (gaps.some(g => Math.abs(x - g) < 56 * M2.k)) continue;
+    for (const s of [-1, 1]) {
+      const g = ctx.createRadialGradient(x - 3, y + s * half - 3, 1, x, y + s * half, 10 * M2.k);
+      g.addColorStop(0, '#ffd3dc'); g.addColorStop(1, C.membrane);
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y + s * half, 9.5 * M2.k, 0, TAU); ctx.fill();
+    }
+  }
+  ctx.restore();
+  if (flashA > 0) {
+    ctx.save(); ctx.globalAlpha *= alpha * flashA;
+    const g = ctx.createLinearGradient(0, y - half - 30, 0, y + half + 30);
+    g.addColorStop(0, 'rgba(255,230,128,0)'); g.addColorStop(0.5, 'rgba(255,240,170,0.75)'); g.addColorStop(1, 'rgba(255,230,128,0)');
+    ctx.fillStyle = g; ctx.fillRect(x0, y - half - 30, x1 - x0, half * 2 + 60);
+    ctx.restore();
+  }
+}
+
+// A door: two protein halves that slide apart, with a glow in the pore in its ion's colour when open.
+function door2D(ctx, key, open, alpha, hi = 0) {
+  if (alpha <= 0) return;
+  const x = mx(DOOR_X[key]), y = M2.cy, col = DOOR_COL[key];
+  const gap = (8 + 34 * clamp(open)) * M2.k, hw = 23 * M2.k, hh = 82 * M2.k;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  if (hi > 0) glow(ctx, x, y, 150, C[ION_OF[key]], 0.35 * hi);
+  if (open > 0.05) {
+    ctx.save(); ctx.globalAlpha *= clamp(open * 1.6);
+    const g = ctx.createLinearGradient(0, y - hh, 0, y + hh);
+    g.addColorStop(0, 'rgba(255,255,255,0)'); g.addColorStop(0.5, C[ION_OF[key]]); g.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g; ctx.fillRect(x - gap / 2, y - hh, gap, hh * 2);
+    ctx.restore();
+  }
+  for (const s of [-1, 1]) {
+    const cx = x + s * (gap / 2 + hw);
+    const g = ctx.createLinearGradient(cx - hw, 0, cx + hw, 0);
+    const c0 = new THREE.Color(col), lite = c0.clone().lerp(new THREE.Color('#ffffff'), 0.35), dark = c0.clone().multiplyScalar(0.62);
+    g.addColorStop(0, s < 0 ? `#${lite.getHexString()}` : `#${dark.getHexString()}`);
+    g.addColorStop(1, s < 0 ? `#${dark.getHexString()}` : `#${lite.getHexString()}`);
+    ctx.fillStyle = g;
+    // Waisted like the 3D protein: wider where it sticks out of the membrane on each side.
+    ctx.beginPath();
+    const wv = (yy, k) => cx + k * (hw - 5 * Math.exp(-Math.pow((yy - y) / 34, 2)));
+    ctx.moveTo(wv(y - hh, -1), y - hh + 16);
+    for (let yy = y - hh + 16; yy <= y + hh - 16; yy += 6) ctx.lineTo(wv(yy, -1), yy);
+    ctx.quadraticCurveTo(cx - hw, y + hh, cx, y + hh); ctx.quadraticCurveTo(cx + hw, y + hh, wv(y + hh - 16, 1), y + hh - 16);
+    for (let yy = y + hh - 16; yy >= y - hh + 16; yy -= 6) ctx.lineTo(wv(yy, 1), yy);
+    ctx.quadraticCurveTo(cx + hw, y - hh, cx, y - hh); ctx.quadraticCurveTo(cx - hw, y - hh, wv(y - hh + 16, -1), y - hh + 16);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.lineWidth = 2; ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// 2D ion matching a 3D ion of radius ION_R on the flat strip.
+function ion2D(ctx, x, y, kind, alpha = 1, scale = 1, fixed = 0) {
+  if (alpha <= 0) return;
+  const ION_PX = fixed || ION_R * M2.ppu * 1.1;
+  glow(ctx, x, y, ION_PX * 2.6 * scale, C[kind], 0.35 * alpha);
+  ion(ctx, x, y, kind, ION_PX * scale, alpha);
+}
+// Point on an ion's trip through a door (2D), p 0..1, dir 'in' (down) or 'out' (up).
+function doorTrip(key, p, seed, dir) {
+  const x = mx(DOOR_X[key]);
+  const sgn = dir === 'in' ? 1 : -1;
+  const k = M2.k, a = (rand(seed) - 0.5) * 200 * k, b = (rand(seed + 9) - 0.5) * 220 * k;
+  const P0 = [x + a, M2.cy - sgn * 175 * k], P1 = [x, M2.cy - sgn * 90 * k], P2 = [x, M2.cy + sgn * 90 * k], P3 = [x + b, M2.cy + sgn * 190 * k];
+  const q = clamp(p);
+  if (q < 0.3) { const u = easeIO(q / 0.3); return [lerp(P0[0], P1[0], u), lerp(P0[1], P1[1], u)]; }
+  if (q < 0.65) { const u = (q - 0.3) / 0.35; return [P1[0], lerp(P1[1], P2[1], u)]; }
+  const u = easeOut((q - 0.65) / 0.35); return [lerp(P2[0], P3[0], u), lerp(P2[1], P3[1], u)];
+}
+
+// ================================================================ the beat: phases, narrated beat and loop
+// One beat as a function of phase p: creep (leak), spike (calcium), short peak, reset (potassium).
+const PH = { spike: 0.5, peak: 0.62, reset: 0.66 };
+const V_REST = -60, V_TIP = -40, V_PEAK = 12;
+function vOf(p) {
+  if (p <= PH.spike) return V_REST + (V_TIP - V_REST) * Math.pow(p / PH.spike, 1.7);
+  if (p <= PH.peak) { const q = (p - PH.spike) / (PH.peak - PH.spike); return V_TIP + (V_PEAK - V_TIP) * q * q * (3 - 2 * q); }
+  if (p <= PH.reset) return V_PEAK - 2 * (p - PH.peak) / (PH.reset - PH.peak);
+  return V_PEAK - 2 - (V_PEAK - 2 - V_REST) * easeIO((p - PH.reset) / (1 - PH.reset));
+}
+const PH_COL = { creep: '#ff9f43', spark: '#fff1a8', reset: C.k };
+const phaseOf = p => (p < PH.spike ? 'creep' : p < PH.reset ? 'spark' : 'reset');
+
+// Cycles: the first is slowed down to the narration, the rest run on their own.
+// Each: { t0, t1, p(t) }.
+const CYCLES = [];
+{
+  const n1 = G.warp([[T.trickle + 0.1, 0], [T.fling - 0.15, PH.spike], [T.rushes - 0.25, PH.spike], [T.flips + 0.6, PH.peak], [T.flows - 0.1, PH.reset], [T.drops + 1.0, 1]]);
+  CYCLES.push({ t0: -Infinity, t1: T.again + 0.1, p: n1, narrated: true });
+  // Loop cycle with creep c, spike s, peak k and reset r seconds.
+  const cyc = (t0, c, s, k, r) => {
+    const f = G.warp([[t0, 0], [t0 + c, PH.spike], [t0 + c + s, PH.peak], [t0 + c + s + k, PH.reset], [t0 + c + s + k + r, 1]]);
+    return { t0, t1: t0 + c + s + k + r, p: f, c, s, k, r };
+  };
+  // Second cycle: its creep, spark and reset land on the spoken "Creep, spark, reset".
+  let c2 = cyc(T.again + 0.1, T.wSpark - 0.12 - (T.again + 0.1), 0.24, 0.08, 0.62);
+  CYCLES.push(c2);
+  let t0 = c2.t1;
+  while (t0 < S.end2D + 1) { const c = cyc(t0, 0.95, 0.2, 0.06, 0.5); CYCLES.push(c); t0 = c.t1; }
+}
+const cycleAt = t => { for (let k = CYCLES.length - 1; k >= 0; k--) if (t >= CYCLES[k].t0) return k; return 0; };
+const pAt = t => { const k = cycleAt(t); return { k, p: CYCLES[k].p(t), cyc: CYCLES[k] }; };
+// Time a cycle reaches phase p (for flows and flashes).
+function tOfP(cyc, p) {
+  let a = Math.max(cyc.t0, T.trickle - 1), b = cyc.t1;
+  for (let i = 0; i < 40; i++) { const m = (a + b) / 2; if (cyc.p(m) < p) a = m; else b = m; }
+  return b;
+}
+const CYC_T = CYCLES.map(c => ({ spike: tOfP(c, PH.spike), peak: tOfP(c, PH.peak), reset: tOfP(c, PH.reset), end: tOfP(c, 0.999) }));
+
+// Door openings and ion trips for every cycle.
+function doorOpen(t) {
+  let leak = 0.38 * seg(t, T.leaky - 0.3, T.leaky + 0.3), ca = 0, k = 0;
+  CYCLES.forEach((c, i) => {
+    const ct = CYC_T[i];
+    const caA = c.narrated ? T.fling - 0.05 : ct.spike - 0.12, caB = c.narrated ? T.kOpen - 0.2 : ct.reset;
+    const kA = c.narrated ? T.kOpen + 0.3 : ct.reset - 0.05, kB = c.narrated ? T.again - 0.2 : ct.end;
+    ca = Math.max(ca, env(t, caA, caB, c.narrated ? 0.3 : 0.1));
+    k = Math.max(k, env(t, kA, kB, c.narrated ? 0.3 : 0.1));
+  });
+  return { leak, ca, k };
+}
+const TRIPS = [];
+CYCLES.forEach((c, i) => {
+  const ct = CYC_T[i];
+  if (c.narrated) {
+    for (let j = 0; j < 11; j++) TRIPS.push({ key: 'leak', t0: T.trickle - 0.2 + j * 0.55, d: 1.7, seed: 100 + j, dir: 'in' });
+    for (let j = 0; j < 14; j++) TRIPS.push({ key: 'ca', t0: T.rushes - 0.7 + j * 0.13, d: 1.1, seed: 200 + j, dir: 'in' });
+    for (let j = 0; j < 12; j++) TRIPS.push({ key: 'k', t0: T.flows - 0.6 + j * 0.17, d: 1.2, seed: 300 + j, dir: 'out' });
+  } else {
+    const startA = c.t0 - (i === 1 ? 0 : 0.2);
+    for (let j = 0; j < 3; j++) TRIPS.push({ key: 'leak', t0: startA + j * c.c / 3, d: 0.9, seed: 400 + i * 10 + j, dir: 'in' });
+    for (let j = 0; j < 6; j++) TRIPS.push({ key: 'ca', t0: ct.spike - 0.35 + j * 0.06, d: 0.6, seed: 500 + i * 10 + j, dir: 'in' });
+    for (let j = 0; j < 5; j++) TRIPS.push({ key: 'k', t0: ct.reset - 0.25 + j * 0.08, d: 0.65, seed: 600 + i * 10 + j, dir: 'out' });
+  }
+});
+// Yellow-white firing flash on the cell for each cycle's spark.
+function fireFlash(t) {
+  let f = 0;
+  CYCLES.forEach((c, i) => {
+    if (c.narrated) {
+      f = Math.max(f, Math.exp(-Math.max(0, t - (T.flips + 0.5)) / 0.5) * seg(t, T.flips + 0.2, T.flips + 0.5));
+      f = Math.max(f, env(t, T.firing - 0.3, T.spark + 1.2, 0.5) * (0.85 + 0.15 * Math.sin((t - T.firing) * 9)));
+    } else {
+      const tp = CYC_T[i].peak - 0.05;
+      if (t >= tp - 0.08) f = Math.max(f, Math.exp(-Math.max(0, t - tp) / 0.25) * seg(t, tp - 0.08, tp));
+    }
+  });
+  return clamp(f);
+}
+
+// ================================================================ the 2D cell strip
+function cellStrip(ctx, t, alpha, show) {
+  if (alpha <= 0) return;
+  const op = doorOpen(t);
+  const flash = fireFlash(t) * seg(t, T.rushes, T.rushes + 0.5);
+  // Inside the cell glows yellow-white as it fires.
+  if (flash > 0) {
+    ctx.save(); ctx.globalAlpha = alpha * flash;
+    // A soft oval of light filling the inside of the cell, cut off only at the membrane.
+    ctx.beginPath(); ctx.rect(0, M2.cy, W, H - M2.cy); ctx.clip();
+    ctx.translate(M2.cx, M2.cy + 0.6 * M2.ppu); ctx.scale(1, 0.42);
+    const R = 8.4 * M2.ppu;
+    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, R);
+    g.addColorStop(0, 'rgba(255,240,170,0.6)'); g.addColorStop(0.55, 'rgba(255,236,150,0.3)'); g.addColorStop(1, 'rgba(255,230,128,0)');
+    ctx.fillStyle = g; ctx.fillRect(-R, -R, 2 * R, 2 * R);
+    ctx.restore();
+  }
+  // Ion clouds (the same drifting positions as the 3D ions, laid flat).
+  const dim = show.dim || (() => 1);
+  for (const kind of ['na', 'ca', 'k']) {
+    const sc = show.scale ? show.scale(kind) : 1;
+    for (const v of cloud(kind, t)) ion2D(ctx, mx(v.x), my(v.y), kind, alpha * dim(kind), sc);
+  }
+  membrane2D(ctx, alpha, flash * 0.8);
+  for (const key of ['leak', 'ca', 'k']) door2D(ctx, key, op[key], alpha * (show.doorAlpha ?? 1), show.doorHi ? show.doorHi(key) : 0);
+  // Ions travelling through the doors.
+  for (const tr of TRIPS) {
+    const p = (t - tr.t0) / tr.d;
+    if (p <= 0 || p >= 1) continue;
+    const [x, y] = doorTrip(tr.key, p, tr.seed, tr.dir);
+    ion2D(ctx, x, y, ION_OF[tr.key], alpha * Math.min(1, p * 6, (1 - p) * 4));
+  }
+}
+
+// ================================================================ legend (top right)
+const LEG = { x: 1540, y: 36, w: 340, rowH: 62 };
+function legend(ctx, t, alpha) {
+  if (alpha <= 0) return;
+  const rows = [['na', 'Sodium', T.na], ['k', 'Potassium', T.k], ['ca', 'Calcium', T.ca]];
+  const pos = seg(t, T.positive - 0.1, T.positive + 0.4);
+  const shown = rows.reduce((n, r) => n + easeOut(seg(t, r[2] - 0.3, r[2] + 0.05)), 0);
+  const h = 24 + shown * LEG.rowH + 62 * pos;
+  ctx.save(); ctx.globalAlpha *= alpha * seg(t, T.na - 0.3, T.na);
+  ctx.fillStyle = 'rgba(5,10,30,0.66)'; roundRect(ctx, LEG.x, LEG.y, LEG.w, h, 18); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.restore();
+  rows.forEach(([kind, name, tw], k) => {
+    const a = alpha * seg(t, tw - 0.15, tw + 0.25);
+    const cy = LEG.y + 12 + LEG.rowH * (k + 0.5);
+    const pop = 1 + 0.3 * Math.exp(-Math.pow((t - tw - 0.25) / 0.2, 2)) + 0.2 * Math.exp(-Math.pow((t - T.positive - 0.4) / 0.25, 2));
+    ion2D(ctx, LEG.x + 48, cy, kind, a, pop, 17);
+    text(ctx, name, LEG.x + 90, cy + 1, 34, C.text, 'left', 700, a);
+  });
+  text(ctx, '+  all positive', LEG.x + 34, LEG.y + 12 + LEG.rowH * 3 + 30, 32, '#ffe9c2', 'left', 800, alpha * pos);
+}
+
+// ================================================================ battery (cue 2)
+function battery(ctx, t, alpha) {
+  if (alpha <= 0) return;
+  const p = easeOut(seg(t, T.battery - 0.35, T.battery + 0.35));
+  const k = lerp(0.7, 1, p);
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.translate(M2.cx, M2.cy); ctx.scale(k * M2.k, k * M2.k);
+  const bw = 210, bh = 470;
+  ctx.shadowColor = 'rgba(0,0,0,0.5)'; ctx.shadowBlur = 30;
+  ctx.fillStyle = 'rgba(12,20,52,0.9)'; roundRect(ctx, -bw / 2, -bh / 2, bw, bh, 34); ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = 'rgba(230,236,255,0.92)'; roundRect(ctx, -44, -bh / 2 - 34, 88, 40, 12); ctx.fill();
+  ctx.strokeStyle = 'rgba(230,236,255,0.92)'; ctx.lineWidth = 8; roundRect(ctx, -bw / 2, -bh / 2, bw, bh, 34); ctx.stroke();
+  // Divider at the membrane: plus outside, minus inside.
+  ctx.strokeStyle = 'rgba(230,236,255,0.35)'; ctx.lineWidth = 3; ctx.setLineDash([12, 10]);
+  ctx.beginPath(); ctx.moveTo(-bw / 2 + 16, 0); ctx.lineTo(bw / 2 - 16, 0); ctx.stroke(); ctx.setLineDash([]);
+  ctx.restore();
+  const neg = 1 + 0.25 * Math.exp(-Math.pow((t - T.negative - 0.3) / 0.25, 2));
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.translate(M2.cx, M2.cy); ctx.scale(k * M2.k, k * M2.k);
+  ctx.font = `800 150px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffffff'; ctx.fillText('+', 0, -118);
+  ctx.save(); ctx.translate(0, 112); ctx.scale(neg, neg);
+  ctx.shadowColor = 'rgba(140,200,255,0.9)'; ctx.shadowBlur = 30 * (neg - 1) * 4;
+  ctx.fillStyle = '#ffffff'; ctx.fillRect(-46, -12, 92, 24);
+  ctx.restore();
+  ctx.restore();
+}
+
+// ================================================================ voltage graph (right panel)
+const GP = { x: 1170, y: 330, w: 700, h: 590 };
+const PL = { x0: 1340, x1: 1835, y0: 440, y1: 790, hi: 25, lo: -75 };
+const gx = p => lerp(PL.x0, PL.x1, p), gy = v => PL.y0 + (PL.y1 - PL.y0) * (PL.hi - v) / (PL.hi - PL.lo);
+
+// Trace for phases 0..p, coloured by phase.
+function trace(ctx, p, alpha, o = {}) {
+  if (alpha <= 0 || p <= 0) return;
+  const N = 220;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.lineWidth = o.width || 6; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  for (const [name, a, b] of [['creep', 0, PH.spike], ['spark', PH.spike, PH.reset], ['reset', PH.reset, 1]]) {
+    if (p <= a) break;
+    const e = Math.min(p, b);
+    const col = PH_COL[name];
+    ctx.strokeStyle = col; ctx.shadowColor = col; ctx.shadowBlur = name === 'spark' ? 22 : 12;
+    ctx.beginPath();
+    const n = Math.max(2, Math.ceil(N * (e - a)));
+    for (let i = 0; i <= n; i++) { const q = a + (e - a) * i / n; i ? ctx.lineTo(gx(q), gy(vOf(q))) : ctx.moveTo(gx(q), gy(vOf(q))); }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function graph(ctx, t, alpha) {
+  if (alpha <= 0) return;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.fillStyle = 'rgba(5,10,30,0.6)'; roundRect(ctx, GP.x, GP.y, GP.w, GP.h, 24); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.14)'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.restore();
+  text(ctx, 'Charge inside the cell', GP.x + 32, GP.y + 46, 36, C.text, 'left', 700, alpha);
+  // Axis: positive, 0, negative (no numbers).
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.strokeStyle = 'rgba(255,255,255,0.3)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(PL.x0, gy(0)); ctx.lineTo(PL.x1, gy(0)); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(PL.x0, PL.y0 - 10); ctx.lineTo(PL.x0, PL.y1 + 10); ctx.stroke();
+  ctx.restore();
+  const { k, p, cyc } = pAt(t);
+  const v = vOf(p);
+  const negHi = env(t, GP_IN, T.trickle, 0.3);
+  text(ctx, 'positive', PL.x0 - 18, gy(18), 30, v > 0 && t > T.rushes ? PH_COL.spark : C.dim, 'right', 700, alpha);
+  text(ctx, '0', PL.x0 - 18, gy(0), 30, C.dim, 'right', 700, alpha);
+  text(ctx, 'negative', PL.x0 - 18, gy(-60), 30, negHi > 0 ? lerpColour(C.dim, '#ffffff', negHi) : C.dim, 'right', 700, alpha);
+  // Tipping point.
+  const tp = alpha * seg(t, T.tipping - 0.35, T.tipping + 0.2);
+  if (tp > 0) {
+    const hot = p >= PH.spike - 0.01 && p < PH.peak && k === 0 ? 1 : 0;
+    ctx.save(); ctx.globalAlpha *= tp;
+    ctx.strokeStyle = hot ? '#ffffff' : 'rgba(255,255,255,0.6)'; ctx.lineWidth = 3; ctx.setLineDash([12, 10]);
+    const w2 = (PL.x1 - PL.x0) * easeOut(seg(t, T.tipping - 0.35, T.tipping + 0.3));
+    ctx.beginPath(); ctx.moveTo(PL.x0, gy(V_TIP)); ctx.lineTo(PL.x0 + w2, gy(V_TIP)); ctx.stroke();
+    ctx.restore();
+    text(ctx, 'tipping point', PL.x0 + 18, gy(V_TIP) - 26, 30, '#ffffff', 'left', 700, tp);
+  }
+  // Previous cycle fades as the new one starts drawing (the graph clears every cycle, no scrolling).
+  if (k > 0) {
+    const prevFade = 1 - seg(t, cyc.t0, cyc.t0 + 0.3);
+    trace(ctx, 1, alpha * prevFade * 0.8);
+  }
+  const started = t >= T.trickle - 0.2 || k > 0;
+  trace(ctx, p, alpha);
+  // The live point.
+  const dotA = alpha * seg(t, GP_IN, GP_IN + 0.4);
+  if (dotA > 0) {
+    const col = PH_COL[phaseOf(p)];
+    glow(ctx, gx(p), gy(v), 40, started ? col : '#ffffff', 0.6 * dotA);
+    ctx.save(); ctx.globalAlpha *= dotA; ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(gx(p), gy(v), 10, 0, TAU); ctx.fill(); ctx.restore();
+  }
+  // CREEP, SPARK, RESET: lit when spoken, then in time with the loop.
+  const words = [['CREEP', 'creep', T.wCreep, 1430], ['SPARK', 'spark', T.wSpark, 1595], ['RESET', 'reset', T.wReset, 1760]];
+  for (const [s, ph, tw, x] of words) {
+    const on = seg(t, tw - 0.08, tw + 0.12);
+    if (on <= 0) continue;
+    const active = t < T.wReset + 0.6 ? env(t, tw - 0.08, tw + 0.55, 0.1) : (phaseOf(p) === ph ? 1 : 0);
+    const a = alpha * on * lerp(0.35, 1, active);
+    if (active > 0) glow(ctx, x, 870, 90, PH_COL[ph], 0.35 * active * alpha);
+    text(ctx, s, x, 870, 40, active > 0.5 ? PH_COL[ph] : C.dim, 'center', 800, a);
+  }
+}
+const GP_IN = cs(3) + 0.1;
+function lerpColour(a, b, p) {
+  const ca = new THREE.Color(a), cb = new THREE.Color(b);
+  return `#${ca.lerp(cb, clamp(p)).getHexString()}`;
+}
+
+// ================================================================ 2D overlay text for the strip
+function stripLabels(ctx, t, alpha) {
+  if (alpha <= 0) return;
+  const tx = mx(-8) + 110, tyO = my(3.45) - 52, tyI = my(-3.45) + 52;
+  G.tag(ctx, 'outside the cell', tx, tyO, { size: 30, color: C.dim, alpha });
+  // The inside label carries the charge: negative, flipping to positive while the cell fires.
+  const { p, k } = pAt(t);
+  // The label flips back on the spoken 'drops', a beat after the trace crosses zero.
+  const DOWN_T = T.drops - 0.15;
+  const pos = t > T.rushes && t < T.again && (vOf(p) > 0 || (t > CROSS_UP && t < DOWN_T));
+  // Fade out fully before 'inside the cell' fades in, since the two pills differ in width and would garble.
+  const insideA = alpha * (1 - seg(t, T.again - 0.3, T.again + 0.1));
+  if (t < T.negative - 0.1) G.tag(ctx, 'inside the cell', tx, tyI, { size: 30, color: C.dim, alpha });
+  else if (insideA > 0) {
+    const flipT = pos ? CROSS_UP : DOWN_T;
+    const pop = 1 + 0.18 * Math.exp(-Math.pow((t - flipT - 0.15) / 0.18, 2)) + 0.18 * Math.exp(-Math.pow((t - T.negative - 0.2) / 0.18, 2));
+    // The longer negative label keeps the short one's left edge, so it grows rightwards instead of off screen.
+    // The pop scales about that left edge too, so the overshoot never pushes the pill past the frame.
+    const s = pos ? 'inside: positive' : 'inside: negative compared to outside';
+    ctx.save(); ctx.font = `700 32px ${FONT}`;
+    const shortW = ctx.measureText('inside: negative').width;
+    const cx = tx + (ctx.measureText(s).width - shortW) / 2, x0 = tx - shortW / 2;
+    ctx.translate(x0, tyI); ctx.scale(pop, pop);
+    G.tag(ctx, s, (pos ? tx : cx) - x0, 0, { size: 32, color: pos ? PH_COL.spark : '#ffffff', alpha: insideA });
+    ctx.restore();
+  }
+  if (t >= T.again - 0.3) G.tag(ctx, 'inside the cell', tx, tyI, { size: 30, color: C.dim, alpha: alpha * seg(t, T.again + 0.1, T.again + 0.5) });
+  // Door names, as each is spoken.
+  const doorT = { leak: T.leaky - 0.1, ca: T.fling - 0.3, k: T.kOpen - 0.1 };
+  for (const key of ['leak', 'ca', 'k']) {
+    const a = alpha * seg(t, doorT[key], doorT[key] + 0.35);
+    G.tag(ctx, DOOR_NAME[key], mx(DOOR_X[key]), 210, { size: 32, color: lerpColour(DOOR_COL[key], '#ffffff', 0.45), alpha: a, to: [mx(DOOR_X[key]), M2.cy - 96 * M2.k] });
+  }
+  // SPARK! as the voice says it.
+  const sa = alpha * env(t, T.spark - 0.1, T.spark + 1.6, 0.25);
+  if (sa > 0) {
+    const pop = 1.25 - 0.25 * easeOut(seg(t, T.spark - 0.1, T.spark + 0.3));
+    ctx.save(); ctx.globalAlpha = sa; ctx.translate(M2.cx, my(-3.45) + 62); ctx.scale(pop, pop);
+    ctx.font = `800 88px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.shadowColor = 'rgba(255,230,128,0.9)'; ctx.shadowBlur = 40; ctx.fillStyle = '#fff6d0'; ctx.fillText('SPARK!', 0, 0);
+    ctx.restore();
+  }
+}
+// When the narrated beat crosses zero on the way up and on the way down.
+const CROSS_UP = (() => { const c = CYCLES[0]; let a = T.rushes, b = T.flips + 1; for (let i = 0; i < 40; i++) { const m = (a + b) / 2; if (vOf(c.p(m)) < 0) a = m; else b = m; } return b; })();
+const CROSS_DOWN = (() => { const c = CYCLES[0]; let a = T.kOpen, b = T.again; for (let i = 0; i < 40; i++) { const m = (a + b) / 2; if (vOf(c.p(m)) > 0) a = m; else b = m; } return b; })();
+
+// ================================================================ cue 6: three stacked traces
+const STRIPS = [
+  { label: 'normal', creep: 0.95, t0: S.end2D + 0.45, sweep: 0 },
+  { label: 'adrenaline: faster', creep: 0.3, t0: T.adrenaline + 0.05, sweep: 2.4 },
+  { label: 'calming nerves: slower', creep: 2.1, t0: T.calming - 0.05, sweep: 2.1 },
+];
+const SP = { x: 110, w: 1700, h: 225, tops: [140, 405, 670] };
+const FIXED = 0.2 + 0.06 + 0.5;               // spike + peak + reset seconds, the same at every rate
+const WINDOW = 7.2;                            // seconds of trace across a strip
+function stripV(tt, creep) {
+  const per = creep + FIXED, u = ((tt % per) + per) % per;
+  if (u < creep) return vOf(PH.spike * u / creep);
+  const r = u - creep;
+  if (r < 0.2) return vOf(PH.spike + (PH.peak - PH.spike) * r / 0.2);
+  if (r < 0.26) return vOf(PH.peak + (PH.reset - PH.peak) * (r - 0.2) / 0.06);
+  return vOf(PH.reset + (1 - PH.reset) * (r - 0.26) / 0.5);
+}
+const stripPhase = (tt, creep) => { const per = creep + FIXED, u = ((tt % per) + per) % per; return u < creep ? 'creep' : u < creep + 0.26 ? 'spark' : 'reset'; };
+function heartIcon(ctx, x, y, s, alpha, beatK) {
+  if (alpha <= 0) return;
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.translate(x, y); ctx.scale(s * (1 + 0.22 * beatK), s * (1 + 0.22 * beatK));
+  ctx.fillStyle = C.muscle; ctx.shadowColor = 'rgba(255,90,110,0.7)'; ctx.shadowBlur = 20 * beatK;
+  ctx.beginPath(); ctx.moveTo(0, 30);
+  ctx.bezierCurveTo(-46, 0, -40, -38, -18, -38); ctx.bezierCurveTo(-6, -38, 0, -28, 0, -20);
+  ctx.bezierCurveTo(0, -28, 6, -38, 18, -38); ctx.bezierCurveTo(40, -38, 46, 0, 0, 30); ctx.fill();
+  ctx.restore();
+}
+function strips(ctx, t, alpha) {
+  if (alpha <= 0) return;
+  title(ctx, 'Changing the pace', alpha);
+  STRIPS.forEach((st, i) => {
+    const a = alpha * seg(t, st.t0 - 0.2, st.t0 + 0.3);
+    if (a <= 0) return;
+    const top = SP.tops[i], x0 = SP.x + 300, x1 = SP.x + SP.w - 40, y0 = top + 30, y1 = top + SP.h - 22;
+    ctx.save(); ctx.globalAlpha *= a;
+    ctx.fillStyle = 'rgba(5,10,30,0.6)'; roundRect(ctx, SP.x, top, SP.w, SP.h, 22); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.14)'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.restore();
+    const Y = v => y0 + (y1 - y0) * (PL.hi - v) / (PL.hi - PL.lo);
+    // Faint zero line and tipping point.
+    ctx.save(); ctx.globalAlpha *= a;
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x0, Y(0)); ctx.lineTo(x1, Y(0)); ctx.stroke();
+    ctx.setLineDash([10, 10]); ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+    ctx.beginPath(); ctx.moveTo(x0, Y(V_TIP)); ctx.lineTo(x1, Y(V_TIP)); ctx.stroke(); ctx.setLineDash([]);
+    ctx.restore();
+    // Sweep: the trace draws left to right once, then holds.
+    const f = st.sweep ? seg(t, st.t0, st.t0 + st.sweep) : 1;
+    const N = 700;
+    ctx.save(); ctx.globalAlpha *= a; ctx.lineWidth = 5; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    let cur = null;
+    for (let k = 0; k <= N * f; k++) {
+      const tt = WINDOW * k / N, ph = stripPhase(tt, st.creep);
+      const X = lerp(x0, x1, k / N), Yv = Y(stripV(tt, st.creep));
+      if (ph !== cur) {
+        if (cur) ctx.stroke();
+        ctx.strokeStyle = PH_COL[ph]; ctx.shadowColor = PH_COL[ph]; ctx.shadowBlur = ph === 'spark' ? 16 : 8;
+        ctx.beginPath(); ctx.moveTo(X, Yv); cur = ph;
+      } else ctx.lineTo(X, Yv);
+    }
+    if (cur) ctx.stroke();
+    ctx.restore();
+    if (st.sweep && f > 0 && f < 1) {
+      const tt = WINDOW * f;
+      glow(ctx, lerp(x0, x1, f), Y(stripV(tt, st.creep)), 36, '#ffffff', 0.6 * a);
+    }
+    // Label and a small heart that beats on every spark the sweep draws (or on its own rhythm once drawn).
+    text(ctx, st.label, SP.x + 30, top + 46, 34, C.text, 'left', 700, a);
+    const per = st.creep + FIXED;
+    const scaleT = st.sweep ? WINDOW / st.sweep : WINDOW / 2.3;
+    const tt = (t - st.t0) * scaleT;
+    const sinceSpark = ((tt - st.creep) % per + per) % per;
+    const bk = Math.exp(-sinceSpark / (0.18 * scaleT / 2.5)) * (tt > st.creep ? 1 : 0);
+    heartIcon(ctx, SP.x + 150, top + 140, 1.1, a, bk);
+  });
+}
+
+// ================================================================ main
+function draw(ctx, t) {
+  setM2(t);
+  // ---- cue 0 and the dive: the real heart
+  let diveFrom = { x: W / 2, y: H / 2 };
+  if (t < S.cells + 0.1) {
+    const h = heartFrame(ctx, t, 1);
+    diveFrom = h.sa;
+    // The node: a pulsing yellow-white spark with a ring on every fire.
+    const sa = h.sa, on = h.saOn * (1 - seg(t, S.cells - 0.2, S.cells + 0.3));
+    if (on > 0) {
+      const pl = saPulse(t);
+      glow(ctx, sa.x, sa.y, 70 + 50 * pl, C.spark, on * (0.45 + 0.5 * pl));
+      const rp = ((saPhase(t) % 1) * SA_P) / 0.7;
+      if (rp < 1 && t > SA_T0) {
+        ctx.save(); ctx.globalAlpha = on * (1 - rp) * 0.8; ctx.strokeStyle = '#fff2b0'; ctx.lineWidth = 4;
+        ctx.beginPath(); ctx.arc(sa.x, sa.y, 18 + 70 * easeOut(rp), 0, TAU); ctx.stroke(); ctx.restore();
+      }
+    }
+    const la = 1 - seg(t, S.dive - 0.3, S.dive + 0.2);
+    G.tag(ctx, 'right atrium', h.ra.x - 300, h.ra.y + 150, { size: 36, alpha: la * env(t, T.ra - 0.1, T.sa + 0.05, 0.3), to: [h.ra.x - 20, h.ra.y + 20] });
+    const bx = 1250;
+    const sA = la * seg(t, T.sa - 0.1, T.sa + 0.35);
+    if (sA > 0) {
+      ctx.save(); ctx.globalAlpha = sA * 0.85; ctx.strokeStyle = '#fff2b0'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(bx - 24, 318); ctx.lineTo(sa.x + 26, sa.y - 6); ctx.stroke(); ctx.restore();
+      text(ctx, 'Sinoatrial node', bx, 300, 64, C.text, 'left', 800, sA);
+    }
+    text(ctx, 'your natural pacemaker', bx, 378, 40, C.node, 'left', 700, la * seg(t, T.pacemaker - 0.1, T.pacemaker + 0.35));
+    const rA = la * seg(t, T.rate - 0.1, T.rate + 0.35);
+    if (rA > 0) {
+      const pl = saPulse(t);
+      glow(ctx, bx + 14, 498, 34 + 14 * pl, C.spark, rA * (0.4 + 0.6 * pl));
+      ctx.save(); ctx.globalAlpha = rA; ctx.fillStyle = '#fff6d0'; ctx.beginPath(); ctx.arc(bx + 14, 498, 10 + 4 * pl, 0, TAU); ctx.fill(); ctx.restore();
+      text(ctx, '60 to 100 times a minute', bx + 50, 498, 42, C.text, 'left', 700, rA);
+    }
+    text(ctx, 'all by itself', bx + 50, 562, 42, '#fff2b0', 'left', 700, la * seg(t, T.itself - 0.1, T.itself + 0.35));
+  }
+  // ---- the cluster of pacemaker cells, dissolving in under the node's glow
+  if (t >= S.cells - 0.3 && t < S.mem + 0.3) {
+    clusterShot(t);
+    stage.frame(ctx, easeIO(seg(t, S.cells - 0.3, S.cells + 0.05)));
+  }
+  // Dive: the node's glow swells to fill the middle of the frame and opens onto its cells. The edges stay dark
+  // so the frame never washes out.
+  const up = easeIO(seg(t, S.cells - 0.55, S.cells)), bl = Math.min(up, 1 - easeIO(seg(t, S.cells, S.cells + 0.5)));
+  if (bl > 0) {
+    const bx = lerp(diveFrom.x, W / 2, up), by = lerp(diveFrom.y, H / 2, up), R = lerp(160, 980, up);
+    const rg = ctx.createRadialGradient(bx, by, 0, bx, by, R);
+    rg.addColorStop(0, `rgba(255,248,225,${0.95 * bl})`); rg.addColorStop(0.35, `rgba(255,236,180,${0.65 * bl})`); rg.addColorStop(1, 'rgba(255,226,160,0)');
+    ctx.fillStyle = rg; ctx.fillRect(0, 0, W, H);
+  }
+  // ---- the cell skin (3D), cross-fading in as the camera pushes into one cell, then flattening into the 2D strip
+  let fp = 0;
+  if (t >= S.mem - 0.15 && t < S.flat1 + 0.3) {
+    fp = memShot(t);
+    const a3 = Math.min(easeIO(seg(t, S.mem - 0.15, S.mem + 0.3)), 1 - seg(t, S.to2D, S.flat1 + 0.2));
+    stage.frame(ctx, a3);
+    const la = 1 - seg(t, S.flat0 - 0.3, S.flat0 + 0.1);
+    // Point at the bilayer between the leak and calcium doors, not at a door.
+    const sk = stage.toScreen(memWrap.localToWorld(new THREE.Vector3((DOOR_X.leak + DOOR_X.ca) / 2, 0, 4.4)));
+    G.tag(ctx, 'cell skin', sk.x, sk.y + 200, { size: 40, alpha: la * seg(t, T.skin - 0.1, T.skin + 0.3), to: [sk.x, sk.y + 30] });
+    const da = la * seg(t, T.doors - 0.15, T.doors + 0.25);
+    if (da > 0) {
+      const pts = mem.doors.slice(0, 3).map(d => stage.toScreen(d.group.getWorldPosition(new THREE.Vector3()).add(new THREE.Vector3(0, 1.4, 0))));
+      const lx = 1000, ly = 150;
+      ctx.save(); ctx.globalAlpha = da; ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 3;
+      for (const p of pts) { ctx.beginPath(); ctx.moveTo(lx, ly + 28); ctx.lineTo(p.x, p.y); ctx.stroke(); ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(p.x, p.y, 7, 0, TAU); ctx.fill(); }
+      ctx.restore();
+      G.tag(ctx, 'doors', lx, ly, { size: 42, alpha: da });
+    }
+    G.tag(ctx, 'outside the cell', 175, 150, { size: 30, color: C.dim, alpha: la * seg(t, S.mem + 0.4, S.mem + 0.8) });
+    G.tag(ctx, 'inside the cell', 175, 860, { size: 30, color: C.dim, alpha: la * seg(t, S.mem + 0.4, S.mem + 0.8) });
+  }
+  // Drawn over the membrane cross-fade so it stays readable for a full beat after 'cells'.
+  G.tag(ctx, 'pacemaker cells', W / 2, 150, { size: 38, alpha: env(t, T.cells - 0.2, S.mem + 0.6, 0.25) });
+  // ---- 2D: the strip, battery, graph, loop
+  const a2 = env(t, S.to2D, S.end2D + 0.2, 0.5);
+  if (a2 > 0) {
+    const crowd = env(t, T.crowdOut - 0.1, T.battery - 0.3, 0.3);
+    const inK = seg(t, T.crowdIn - 0.2, T.crowdIn + 0.2);
+    const batA = env(t, T.battery - 0.35, cs(3) - 0.2, 0.4);
+    cellStrip(ctx, t, a2, {
+      dim: kind => {
+        // Potassium dims further so the battery's minus, not the purple ions, carries "inside negative".
+        if (batA > 0) return lerp(1, kind === 'k' ? 0.35 : 0.55, batA);
+        const want = inK > 0 ? (kind === 'k' ? 1 : 0.3) : (kind === 'k' ? 0.3 : 1);
+        return lerp(1, want, crowd);
+      },
+      scale: kind => 1 + 0.25 * crowd * ((inK > 0) === (kind === 'k') ? 1 : 0),
+      doorAlpha: lerp(1, 0.5, Math.max(crowd, batA)),
+      doorHi: key => (key === 'leak' ? env(t, T.leaky - 0.1, T.trickle + 1, 0.3) : key === 'ca' ? env(t, T.fling - 0.2, T.rushes + 1.2, 0.3) : env(t, T.kOpen - 0.1, T.flows + 1, 0.3)),
+    });
+    battery(ctx, t, a2 * batA);
+    text(ctx, 'like a tiny battery', M2.cx, 196, 50, C.text, 'center', 800, a2 * env(t, T.battery - 0.1, cs(3) - 0.2, 0.35));
+    // Brackets saying who crowds where.
+    const oa = a2 * crowd * (1 - inK), ia = a2 * crowd * inK;
+    G.tag(ctx, 'sodium + calcium crowd outside', M2.cx, my(3.45) - 52, { size: 34, color: '#ffe9c2', alpha: oa });
+    G.tag(ctx, 'potassium crowds inside', M2.cx, my(-3.45) + 52, { size: 34, color: '#e2ccff', alpha: ia });
+    stripLabels(ctx, t, a2);
+    graph(ctx, t, a2 * seg(t, GP_IN, GP_IN + 0.6));
+    title(ctx, 'Inside one pacemaker cell', a2);
+  }
+  legend(ctx, t, env(t, T.na - 0.3, S.end2D + 0.2, 0.4));
+  // ---- cue 6
+  strips(ctx, t, seg(t, S.end2D + 0.2, S.end2D + 0.6));
+}
+
+window.S03 = { T, S, CYCLES, CYC_T, CROSS_UP, CROSS_DOWN };
+setup(draw);
+</script>

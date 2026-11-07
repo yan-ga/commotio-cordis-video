@@ -1,0 +1,443 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>s06 lockout</title>
+<script src="lib.js"></script>
+<script src="grid2d.js"></script>
+<script>
+// Part 6, the lockout. All 2D in the s08 brick and padlock style.
+// Cues 0-1: one big sodium door on the cell skin beside the cell it belongs to. The door opens, the lid
+// swings shut and plugs it, the cell locks and knocks bounce off. Potassium leaves, the inside is negative
+// again, the lid drops and the cell is ready. Then two tiny examples: locked + knock, ready + knock.
+// Cues 2-4: a row of 8 cells. Each knocks both ways, the backward knock bounces off the cell that just
+// fired, the wave only goes forwards and dies at the far end. Then the row fires again with fast and slow
+// resetters, and they unlock in a mixed order.
+const G = window.G2;
+const TAU = Math.PI * 2;
+
+const wt = wordAt;
+const T = {
+  lid: wt(0, 'has a lid'), opens: wt(0, 'opens,'), swings: wt(0, 'swings'), plugs: wt(0, 'plugs'), locked: wt(0, 'locked.'),
+  knock: wt(0, 'However'), cant: wt(0, "can't"),
+  c1: cs(1), neg: wt(1, 'back to negative'), unlock: wt(1, 'That takes'), quarter: wt(1, 'about a quarter'),
+  rule: wt(1, 'So a cell'), unlocked: wt(1, "unlocked,"), gets: wt(1, 'gets a knock'),
+  c2: cs(2), each: wt(2, 'Each cell'), behind: wt(2, 'But the cell'), justFired: wt(2, 'only just fired'),
+  ignored: wt(2, 'ignored.'), forwards: wt(2, 'The wave can'),
+  c3: cs(3), crosses: wt(3, 'crosses'), stay: wt(3, 'cells stay'), reaches: wt(3, 'reaches'), nothing: wt(3, 'nothing left'), dies: wt(3, 'and dies'),
+  c4: cs(4), differ: wt(4, 'Cells fire'), reset: wt(4, 'some reset'), together: wt(4, 'So they'),
+};
+
+// ================================================================ shared look (matches s08)
+function stateKey(ctx, x, y, alpha) {
+  if (alpha <= 0) return;
+  const items = [['Ready', 'unlocked'], ['Locked', 'locked'], ['Firing', 'firing']];
+  const w = 290, rowH = 58, h = items.length * rowH + 24;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.fillStyle = 'rgba(5,10,30,0.66)'; roundRect(ctx, x, y, w, h, 18); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth = 2; ctx.stroke();
+  items.forEach(([label, st], k) => {
+    const cy = y + 12 + rowH * (k + 0.5);
+    if (st === 'firing') glow(ctx, x + 62, cy, 50, C.spark, 0.6);
+    G.brick(ctx, x + 62, cy, 76, 44, st, { lockScale: 1.05 });
+    text(ctx, label, x + 120, cy + 1, 32, C.text, 'left', 700);
+  });
+  ctx.restore();
+}
+function title(ctx, s, alpha, size = 50) { text(ctx, s, 80, 88, size, C.text, 'left', 700, alpha); }
+function badge(ctx, s, x, y, alpha) {
+  if (alpha <= 0) return;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.font = `700 30px ${FONT}`;
+  const w = ctx.measureText(s).width + 70;
+  ctx.fillStyle = 'rgba(5,10,30,0.7)'; roundRect(ctx, x, y - 28, w, 56, 28); ctx.fill();
+  ctx.fillStyle = '#ff6b6b'; ctx.beginPath(); ctx.arc(x + 32, y, 9, 0, TAU); ctx.fill();
+  ctx.restore();
+  text(ctx, s, x + 52, y + 1, 30, C.text, 'left', 700, alpha);
+}
+// A brick state with only the three colours: level is always 0 (ready) or 1 (locked).
+const cellState = (locked, o = {}) => ({ level: locked ? 1 : 0, open: o.open ?? (locked ? 0 : 1), fire: o.fire || 0, pulse: o.pulse || 0, lockLeft: o.lockLeft || 0 });
+function arrow(ctx, x0, y0, x1, y1, o = {}) {
+  const a = o.alpha ?? 1;
+  if (a <= 0) return;
+  const col = o.color || '#ffffff', hd = o.head || 30, ang = Math.atan2(y1 - y0, x1 - x0);
+  ctx.save(); ctx.globalAlpha *= a;
+  ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = o.width || 8; ctx.lineCap = 'round';
+  ctx.shadowColor = o.glow || 'rgba(255,255,255,0.5)'; ctx.shadowBlur = 12;
+  ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1 - Math.cos(ang) * hd * 0.8, y1 - Math.sin(ang) * hd * 0.8); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x1, y1);
+  ctx.lineTo(x1 - Math.cos(ang - 0.5) * hd, y1 - Math.sin(ang - 0.5) * hd);
+  ctx.lineTo(x1 - Math.cos(ang + 0.5) * hd, y1 - Math.sin(ang + 0.5) * hd); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+// ================================================================ cues 0-1: the door and its cell
+const PANEL = { x: 70, y: 150, w: 1080, h: 760 };
+const MEM_Y = 530, K = 1.55;                 // membrane line on screen, and the zoom of the door drawing
+const DOOR_X = 520, KDOOR_X = 900;
+const CELL = { x: 1500, y: 560, w: 330, h: 200 };
+const tOpen = () => T.opens - 0.05, tShut = () => T.swings + 0.15;
+const doorOpen = t => Math.min(easeOut(seg(t, tOpen(), tOpen() + 0.35)), 1 - easeIO(seg(t, T.unlock - 0.5, T.unlock + 0.1)));
+const lidShut = t => Math.min(easeOut(seg(t, tShut(), tShut() + 0.45)), 1 - easeIO(seg(t, T.unlock - 0.2, T.unlock + 0.4)));
+const kOpen = t => Math.min(easeOut(seg(t, T.c1 + 0.1, T.c1 + 0.5)), 1 - seg(t, T.neg + 0.9, T.neg + 1.4));
+// The cell fires as the first sodium reaches the pore, and is locked once the lid is fully shut.
+const tCellFire = () => tOpen() + 0.35, tCellLock = () => tShut() + 0.45, tCellReady = () => T.unlock + 0.25;
+
+// Sodium crowd outside: ions 0..NA_IN-1 are the ones that rush in before the lid shuts.
+const NA_N = 26, NA_IN = 12;
+const naHome = i => [PANEL.x + 60 + rand(i + 3) * (PANEL.w - 120), PANEL.y + 140 + rand(i + 40) * 190];
+const naInside = i => [DOOR_X - 260 + rand(i + 80) * 560, MEM_Y + 120 + rand(i + 120) * 170];
+const K_N = 9, K_OUT = 5;
+const kHome = i => [PANEL.x + 120 + rand(i + 200) * (PANEL.w - 200), MEM_Y + 120 + rand(i + 240) * 170];
+const kOutside = i => [KDOOR_X - 120 + rand(i + 260) * 260, PANEL.y + 140 + rand(i + 280) * 160];
+const jig = (i, t, a = 6) => [a * Math.sin(t * 0.9 + i * 1.7), a * Math.cos(t * 0.7 + i * 2.3)];
+
+// Path through a door: from p0 down (dir 1) or up (dir -1) through the pore at x to p1.
+function throughDoor(p0, p1, x, dir, u) {
+  const top = [x, MEM_Y - dir * 110], bot = [x, MEM_Y + dir * 110];
+  if (u < 0.35) { const q = easeIO(u / 0.35); return [lerp(p0[0], top[0], q), lerp(p0[1], top[1], q)]; }
+  if (u < 0.6) { const q = (u - 0.35) / 0.25; return [x, lerp(top[1], bot[1], q)]; }
+  const q = easeOut((u - 0.6) / 0.4); return [lerp(bot[0], p1[0], q), lerp(bot[1], p1[1], q)];
+}
+
+// The big sodium door: two protein halves that slide apart, and a hinged lid on the inside face.
+function bigDoor(ctx, x, y, open, lid, col, colDark, o = {}) {
+  const s = o.scale ?? K;
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+  const gap = 8 + 40 * clamp(open), hw = 50, hh = 82;
+  for (const side of [-1, 1]) {
+    const cx = side * (gap / 2 + hw / 2);
+    const g = ctx.createLinearGradient(cx - hw / 2, 0, cx + hw / 2, 0);
+    g.addColorStop(side < 0 ? 0 : 1, colDark); g.addColorStop(0.5, col); g.addColorStop(side < 0 ? 1 : 0, col);
+    ctx.fillStyle = g; roundRect(ctx, cx - hw / 2, -hh, hw, hh * 2, 22); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.28)'; roundRect(ctx, cx - hw / 2 + 8, -hh + 8, 10, hh * 2 - 16, 5); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 2; roundRect(ctx, cx - hw / 2, -hh, hw, hh * 2, 22); ctx.stroke();
+  }
+  if (o.lid !== false) {
+    // Hinge on the inner bottom corner of the left half. Hanging: points down. Shut: flat across the pore.
+    const hx = -gap / 2 - 6, hy = hh - 4;
+    const ang = lerp(Math.PI * 0.5, 0, clamp(lid));
+    const len = gap + 34;
+    ctx.save(); ctx.translate(hx, hy); ctx.rotate(ang);
+    const lg = ctx.createLinearGradient(0, -12, 0, 12);
+    lg.addColorStop(0, '#ffc3cf'); lg.addColorStop(1, '#e8768e');
+    ctx.fillStyle = lg; roundRect(ctx, -6, -11, len + 6, 22, 11); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = '#7a2a3c'; ctx.beginPath(); ctx.arc(hx, hy, 7, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#ffd6de'; ctx.beginPath(); ctx.arc(hx, hy, 3.5, 0, TAU); ctx.fill();
+  }
+  ctx.restore();
+  return { gap: gap * s, lidTip: (() => { const ang = lerp(Math.PI * 0.5, 0, clamp(lid)); const len = (gap + 30) * s; return [x + (-gap / 2 - 6) * s + Math.cos(ang) * len, y + (hh - 4) * s + Math.sin(ang) * len]; })() };
+}
+
+function doorPanel(ctx, t, A) {
+  if (A <= 0) return;
+  const P = PANEL;
+  ctx.save(); ctx.globalAlpha *= A;
+  roundRect(ctx, P.x, P.y, P.w, P.h, 26); ctx.save(); ctx.clip();
+  ctx.fillStyle = 'rgba(255,255,255,0.035)'; ctx.fillRect(P.x, P.y, P.w, MEM_Y - P.y);
+  ctx.fillStyle = 'rgba(40,10,60,0.42)'; ctx.fillRect(P.x, MEM_Y, P.w, P.y + P.h - MEM_Y);
+  // Inside charge: negative at rest, gone while sodium floods in, negative again once potassium leaves.
+  const neg = Math.max(1 - seg(t, tOpen() + 0.2, tOpen() + 1.0), seg(t, T.neg - 0.6, T.neg + 0.4));
+  for (let i = 0; i < 7; i++) {
+    const x = P.x + 120 + i * 140, y = MEM_Y + 200 + (i % 2) * 70;
+    ctx.save(); ctx.globalAlpha *= 0.8 * neg; ctx.strokeStyle = '#7fb2ff'; ctx.lineWidth = 3;
+    ctx.fillStyle = 'rgba(60,110,220,0.35)'; ctx.beginPath(); ctx.arc(x, y, 19, 0, TAU); ctx.fill(); ctx.stroke(); ctx.restore();
+    text(ctx, '−', x, y - 2, 40, '#cfe0ff', 'center', 800, 0.9 * neg);
+  }
+  membrane(ctx, P.x - 20, P.x + P.w + 20, MEM_Y, [DOOR_X, KDOOR_X], 1);
+  ctx.restore();
+  const dO = doorOpen(t), lS = lidShut(t);
+  // Potassium door: quiet until cue 1, when it does its job. Smaller, no lid.
+  const ka = seg(t, T.c1 - 0.6, T.c1);
+  ctx.save(); ctx.globalAlpha *= lerp(0.45, 1, ka);
+  bigDoor(ctx, KDOOR_X, MEM_Y, kOpen(t), 0, C.k, '#7444c4', { scale: 1.05, lid: false });
+  ctx.restore();
+  bigDoor(ctx, DOOR_X, MEM_Y, dO, lS, C.na, '#c98a12');
+  // Sodium: the crowd outside, the ones that rush in, and the ones that stay put after the lid shuts.
+  // Every one is through the pore (u = 0.6) just before the lid starts to swing, so none pass a shut lid.
+  for (let i = 0; i < NA_N; i++) {
+    const t0 = tOpen() + 0.05 + i * 0.04;
+    const home = naHome(i), j = jig(i, t);
+    let p = [home[0] + j[0], home[1] + j[1]], a = 1;
+    if (i < NA_IN) {
+      const u = seg(t, t0, t0 + 0.9);
+      if (u > 0) { const ins = naInside(i), jj = jig(i + 50, t, 5); p = throughDoor(home, [ins[0] + jj[0] * u, ins[1] + jj[1] * u], DOOR_X, 1, u); }
+      // Most of it is gone from inside by the time the cell is ready again.
+      if (i >= 3) a = 1 - easeIO(seg(t, T.c1 + 0.6, T.neg + 0.6));
+    }
+    ion(ctx, p[0], p[1], 'na', 20, a);
+  }
+  // Potassium: inside the cell, some leave through their door in cue 1.
+  for (let i = 0; i < K_N; i++) {
+    const home = kHome(i), j = jig(i + 300, t);
+    let p = [home[0] + j[0], home[1] + j[1]];
+    if (i < K_OUT) {
+      const t0 = T.c1 + 0.35 + i * 0.32, u = seg(t, t0, t0 + 1.3);
+      if (u > 0) { const out = kOutside(i), jj = jig(i + 320, t, 5); p = throughDoor(home, [out[0] + jj[0] * u, out[1] + jj[1] * u], KDOOR_X, -1, u); }
+    }
+    ion(ctx, p[0], p[1], 'k', 18, ka > 0 ? 1 : 0.9);
+  }
+  text(ctx, 'OUTSIDE THE CELL', P.x + 34, P.y + 44, 30, C.dim, 'left', 700);
+  text(ctx, 'INSIDE THE CELL', P.x + 34, P.y + P.h - 40, 30, C.dim, 'left', 700);
+  ctx.strokeStyle = 'rgba(255,255,255,0.14)'; ctx.lineWidth = 2; roundRect(ctx, P.x, P.y, P.w, P.h, 26); ctx.stroke();
+  ctx.restore();
+
+  // Labels, one at a time, each while the voice says it.
+  const lidPt = [DOOR_X - 8 * K, MEM_Y + 82 * K + 40];
+  G.tag(ctx, 'sodium door', DOOR_X + 60, PANEL.y + 55, { size: 34, color: C.na, alpha: A * env(t, wt(0, 'sodium') - 0.2, T.opens - 0.15, 0.3) });
+  G.tag(ctx, 'lid', DOOR_X - 230, MEM_Y + 250, { size: 36, color: '#ffc3cf', alpha: A * env(t, T.lid - 0.1, T.opens - 0.1, 0.3), to: [lidPt[0] - 14, lidPt[1] - 10] });
+  G.tag(ctx, 'door opens', DOOR_X + 60, PANEL.y + 55, { size: 34, color: C.na, alpha: A * env(t, T.opens - 0.15, T.plugs + 0.2, 0.25) });
+  G.tag(ctx, 'lid swings shut', DOOR_X - 250, MEM_Y + 250, { size: 36, color: '#ffc3cf', alpha: A * env(t, T.swings - 0.15, T.locked + 0.2, 0.25), to: [DOOR_X - 40, MEM_Y + 150] });
+  // One label that grows when the lid plugs the door, kept left-aligned so the first words stay put.
+  const naA = A * env(t, tOpen() + 0.3, T.c1 - 0.1, 0.25);
+  if (naA > 0) {
+    const s = t < T.plugs ? 'sodium rushes in...' : 'sodium rushes in... then plugged';
+    ctx.save(); ctx.font = `700 34px ${FONT}`; const w = ctx.measureText(s).width + 34 * 0.9; ctx.restore();
+    G.tag(ctx, s, 530 + w / 2, MEM_Y + 338, { size: 34, color: C.na, alpha: naA });
+  }
+  G.tag(ctx, 'potassium leaves', KDOOR_X, PANEL.y + 55, { size: 34, color: '#d2b0ff', alpha: A * env(t, T.c1 + 0.3, T.neg + 0.6, 0.3) });
+  G.tag(ctx, 'inside: negative again', 780, MEM_Y + 338, { size: 36, color: '#9cc4ff', alpha: A * env(t, T.neg - 0.1, T.unlock + 0.3, 0.3) });
+  G.tag(ctx, 'lid drops open', DOOR_X - 260, MEM_Y + 120, { size: 36, color: '#ffc3cf', alpha: A * env(t, T.unlock - 0.1, T.rule, 0.3), to: [DOOR_X - 24, MEM_Y + 160] });
+}
+
+function cellSide(ctx, t, A) {
+  if (A <= 0) return;
+  const c = CELL;
+  // Zoom callout: the panel is a close-up of this cell's skin.
+  ctx.save(); ctx.globalAlpha *= A * 0.32; ctx.strokeStyle = '#c9d4f5'; ctx.lineWidth = 3; ctx.setLineDash([8, 10]);
+  const zx = c.x - c.w / 2 + 6, zy = c.y - c.h / 2 + 30;
+  ctx.beginPath(); ctx.arc(zx, zy, 26, 0, TAU); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(zx - 20, zy - 16); ctx.lineTo(PANEL.x + PANEL.w, PANEL.y + 20);
+  ctx.moveTo(zx - 18, zy + 19); ctx.lineTo(PANEL.x + PANEL.w, PANEL.y + PANEL.h - 20); ctx.stroke();
+  ctx.restore();
+  // Tunnel stub to a neighbour off to the right: knocks arrive through it.
+  ctx.save(); ctx.globalAlpha *= A; ctx.lineCap = 'round';
+  ctx.strokeStyle = 'rgba(190,205,240,0.55)'; ctx.lineWidth = 52 * 0.6;
+  ctx.beginPath(); ctx.moveTo(c.x + c.w / 2 - 4, c.y); ctx.lineTo(1930, c.y); ctx.stroke();
+  ctx.strokeStyle = 'rgba(15,25,60,0.85)'; ctx.lineWidth = 13; ctx.stroke();
+  ctx.restore();
+  const fireOn = t >= tCellFire() && t < tCellLock();
+  const locked = t >= tCellFire() && t < tCellReady();
+  const halo = Math.min(seg(t, tCellFire(), tCellFire() + 0.1), 1 - seg(t, tCellLock() - 0.1, tCellLock() + 0.5));
+  if (halo > 0) glow(ctx, c.x, c.y, 330, C.spark, 0.85 * halo * A);
+  const pulse = Math.max(t >= tCellLock() ? 1 - seg(t, tCellLock(), tCellLock() + 0.45) : 0, t >= tCellReady() ? 1 - seg(t, tCellReady(), tCellReady() + 0.45) : 0);
+  const lockLeft = clamp((tCellReady() - t) / (tCellReady() - tCellLock()));
+  const st = cellState(locked, { fire: fireOn ? 1 : 0, pulse, open: t < tCellFire() ? 1 : locked ? 0 : easeOut(seg(t, tCellReady(), tCellReady() + 0.45)), lockLeft: t >= tCellLock() ? lockLeft : 0 });
+  G.brick(ctx, c.x, c.y, c.w, c.h, st, { alpha: A, bar: t >= tCellLock() && t < tCellReady(), lockScale: 1.25 });
+  text(ctx, 'the cell', c.x, c.y - c.h / 2 - 44, 34, C.dim, 'center', 700, A * env(t, -1, T.locked - 0.2, 0.4));
+  // Knocks from the neighbour, each harder than the last, all bouncing off.
+  const lands = [T.knock + 0.5, T.knock + 1.15, T.knock + 1.85], sizes = [13, 19, 27];
+  lands.forEach((tl, k) => {
+    const p = seg(t, tl - 0.5, tl), after = seg(t, tl, tl + 0.65);
+    if (p <= 0 || after >= 1) return;
+    G.drawKnock(ctx, { x: 1925, y: c.y }, c, { p, after, outcome: 'ignored' }, { size: sizes[k], alpha: A, cross: false });
+  });
+  text(ctx, 'LOCKED', c.x, c.y + c.h / 2 + 70, 60, '#ff8a9a', 'center', 800, A * env(t, T.locked - 0.15, T.c1 + 0.3, 0.3));
+  G.tag(ctx, 'knocks ignored', c.x, c.y + c.h / 2 + 160, { size: 36, color: '#ffc2cb', alpha: A * env(t, lands[0], T.c1 + 0.3, 0.3) });
+  G.tag(ctx, 'ready again', c.x, c.y - c.h / 2 - 60, { size: 38, color: '#7fdcf2', alpha: A * env(t, tCellReady() + 0.1, T.rule + 0.3, 0.3) });
+  // The lock time, in real seconds.
+  const qa = A * seg(t, T.quarter - 0.3, T.quarter + 0.2);
+  if (qa > 0) {
+    const x0 = c.x - 230, x1 = c.x + 230, y = c.y + c.h / 2 + 110, grow = easeOut(seg(t, T.quarter - 0.2, T.quarter + 0.6));
+    text(ctx, 'locked for about', c.x, y - 56, 34, C.text, 'center', 700, qa);
+    ctx.save(); ctx.globalAlpha *= qa;
+    ctx.fillStyle = 'rgba(8,14,40,0.8)'; roundRect(ctx, x0, y - 15, x1 - x0, 30, 15); ctx.fill();
+    ctx.fillStyle = G.COL.locked; roundRect(ctx, x0, y - 15, Math.max(30, (x1 - x0) * grow), 30, 15); ctx.fill();
+    ctx.restore();
+    // Closed padlock where the lock starts, open one where it ends.
+    G.padlock(ctx, x0 - 34, y, 40, 0, { alpha: qa, color: '#ff8a9a' });
+    G.padlock(ctx, x1 + 34, y, 40, easeOut(seg(t, T.quarter + 0.4, T.quarter + 0.9)), { alpha: qa * seg(t, T.quarter + 0.3, T.quarter + 0.5), color: '#7fdcf2' });
+    text(ctx, 'a quarter of a second', c.x, y + 56, 40, '#ff8a9a', 'center', 800, qa);
+  }
+}
+
+// ================================================================ cue 1 end: two tiny examples
+function examples(ctx, t, A) {
+  if (A <= 0) return;
+  const rows = [
+    { y: 400, locked: true, label: 'Locked', lc: '#ff8a9a', land: T.rule + 1.0, res: 'ignored', rc: '#ffc2cb' },
+    { y: 680, locked: false, label: 'Ready', lc: '#7fdcf2', land: T.gets + 0.1, res: 'FIRES', rc: C.spark },
+  ];
+  const bx = 1000, bw = 230, bh = 140;
+  for (const r of rows) {
+    const ra = A * seg(t, T.rule - 0.4 + (r.locked ? 0 : 0.5), T.rule + 0.1 + (r.locked ? 0 : 0.5));
+    if (ra <= 0) continue;
+    text(ctx, r.label, 560, r.y - 22, 44, r.lc, 'right', 800, ra);
+    text(ctx, '+ a knock', 560, r.y + 30, 34, C.text, 'right', 700, ra);
+    // A short tunnel the knock arrives through.
+    ctx.save(); ctx.globalAlpha *= ra; ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(190,205,240,0.55)'; ctx.lineWidth = 30; ctx.beginPath(); ctx.moveTo(640, r.y); ctx.lineTo(bx - bw / 2, r.y); ctx.stroke();
+    ctx.strokeStyle = 'rgba(15,25,60,0.85)'; ctx.lineWidth = 13; ctx.stroke();
+    ctx.restore();
+    const fired = !r.locked && t >= r.land;
+    // Held in the flash until the examples fade, so "Ready + a knock → FIRES" never sits beside a red cell.
+    const fireOn = fired;
+    const halo = fired ? seg(t, r.land, r.land + 0.08) : 0;
+    if (halo > 0) glow(ctx, bx, r.y, 260, C.spark, 0.85 * halo * ra);
+    const bump = r.locked && t >= r.land ? 1 - seg(t, r.land, r.land + 0.4) : 0;
+    G.brick(ctx, bx, r.y, bw, bh, cellState(r.locked || fired, { fire: fireOn ? 1 : 0, pulse: bump, open: r.locked || fired ? 0 : 1 }), { alpha: ra, lockScale: 1.2 });
+    const p = seg(t, r.land - 0.7, r.land), after = seg(t, r.land, r.land + 0.8);
+    if (p > 0 && after < 1) G.drawKnock(ctx, { x: 650, y: r.y }, { x: bx, y: r.y, w: bw, h: bh }, { p, after, outcome: r.locked ? 'ignored' : 'fires' }, { size: 18, alpha: ra, cross: false });
+    const resA = ra * seg(t, r.land + 0.05, r.land + 0.35);
+    arrow(ctx, bx + bw / 2 + 40, r.y, bx + bw / 2 + 140, r.y, { alpha: resA * 0.85, width: 6, head: 24 });
+    text(ctx, r.res, bx + bw / 2 + 170, r.y + 2, r.locked ? 48 : 56, r.rc, 'left', 800, resA);
+  }
+}
+
+// ================================================================ cues 2-4: the row of 8 cells
+const ROW = { n: 8, x: 960, y: 600, w: 178, h: 118, gap: 42 };
+const S2 = 26;                          // second wave (cue 4) enters cell 0 at this step
+const LOCK1 = 17.5;                     // first wave: 0.25 s of lock against 0.1 s to cross 7 gaps
+const FAST = { 1: 8.5, 3: 5, 6: 3 };    // second wave: fast resetters, so cells 3, 6, 1 unlock in that order
+const SLOW = { 0: 15, 2: 14, 4: 13.5, 5: 14, 7: 13 };
+const LREF = 15;                        // lock-time bars share one scale, so a short bar means a fast reset
+// rowSim gives each cell a single lock time; this scene needs a different one for each wave.
+const sim = G.simulate(G.rowLayout(ROW), {
+  lock: (i, tf) => (tf < S2 - 0.5 ? LOCK1 : FAST[i] ?? SLOW[i]), half: 0,
+  stim: [{ t: 0, cells: [0], kind: 'spark', from: 'left', travel: 1 }, { t: S2, cells: [0], kind: 'spark', from: 'left', travel: 1 }],
+  until: 60,
+});
+const RL = sim.layout;
+const W_PTS = [
+  [T.c2 + 0.9, -1], [T.c2 + 1.7, 0], [T.each, 1],
+  [T.behind + 0.4, 1.85], [T.ignored - 0.55, 1.97], [T.ignored - 0.3, 2], [T.ignored + 0.6, 2.75],
+  [T.c3, 4.4], [T.reaches + 0.5, 7], [T.nothing, 8], [T.dies + 0.4, 8.75],
+  [T.c4 - 0.2, 17.2], [T.differ - 0.2, 24.8], [T.differ - 0.15, 25], [T.differ + 0.3, 26],
+  [T.reset - 0.3, 33], [T.together - 0.4, 35.6], [TIMING.duration, 41],
+];
+const rowStep = G.warp(W_PTS);
+const rowTime = s => { for (let k = 1; k < W_PTS.length; k++) if (s <= W_PTS[k][1]) { const [a, sa] = W_PTS[k - 1], [b, sb] = W_PTS[k]; return sb === sa ? a : a + (b - a) * (s - sa) / (sb - sa); } return W_PTS[W_PTS.length - 1][0]; };
+// Firing flash in real seconds: about half a second when slow, a little over one step when fast.
+// The brick snaps from firing to locked (a yellow-red blend would read as a fourth, amber state).
+const fireReal = sim.fires.map(f => ({ cell: f.cell, t: rowTime(f.t), len: Math.min(0.55, 1.3 * (rowTime(f.t + 1) - rowTime(f.t))) }));
+function flashAt(i, t) {
+  let brick = 0, halo = 0;
+  for (const f of fireReal) if (f.cell === i && t >= f.t) {
+    const d = t - f.t;
+    if (d < f.len) brick = 1;
+    halo = Math.max(halo, d < 0.06 ? d / 0.06 : 1 - seg(d, f.len - 0.1, f.len + 0.5));
+  }
+  return { brick, halo };
+}
+
+function drawRowCells(ctx, t, s, A) {
+  ctx.save(); ctx.globalAlpha *= A; ctx.lineCap = 'round';
+  for (let i = 0; i < RL.n - 1; i++) {
+    const a = RL.cells[i], b = RL.cells[i + 1];
+    ctx.strokeStyle = 'rgba(190,205,240,0.55)'; ctx.lineWidth = a.h * 0.26;
+    ctx.beginPath(); ctx.moveTo(a.x + a.w / 2 - 4, a.y); ctx.lineTo(b.x - b.w / 2 + 4, b.y); ctx.stroke();
+    ctx.strokeStyle = 'rgba(15,25,60,0.85)'; ctx.lineWidth = a.h * 0.11; ctx.stroke();
+  }
+  ctx.restore();
+  const sts = [];
+  for (let i = 0; i < RL.n; i++) {
+    const st = sim.cellAt(i, s), fl = flashAt(i, t);
+    st.fire = fl.brick;
+    const pu = (t - T.justFired + 0.2) / 0.9;
+    if (i === 0 && pu > 0 && pu < 3) st.pulse = 1 - (pu % 1);
+    if (st.rec && st.rec.t >= S2 - 0.5 && st.state === 'locked') st.lockLeft = clamp((st.rec.t + st.rec.L - s) / LREF);
+    sts.push(st);
+    if (fl.halo > 0) glow(ctx, RL.cells[i].x, RL.cells[i].y, 170, C.spark, 0.85 * fl.halo * A);
+  }
+  for (let i = 0; i < RL.n; i++) {
+    const c = RL.cells[i];
+    const bar = sts[i].rec && sts[i].rec.t >= S2 - 0.5 && sts[i].state === 'locked' && !sts[i].fire;
+    G.brick(ctx, c.x, c.y, c.w, c.h, sts[i], { alpha: A, bar });
+  }
+  for (const k of sim.knocksAt(s)) {
+    // Off either end there is no cell to knock: a pulse heading into empty space reads as a glitch.
+    if (k.to < 0 || k.to >= RL.n) continue;
+    G.drawKnock(ctx, RL.cells[k.from], RL.cells[k.to], k, { size: 16, alpha: A, cross: false });
+  }
+  G.drawStimKnocks(ctx, sim, s, { stimKnockSize: 16, alpha: A });
+  return sts;
+}
+
+// The moment the first wave's last cell knocks back into cell 6.
+const tBack76 = rowTime(sim.knocks.find(k => k.from === 7 && k.to === 6 && k.t0 < S2 - 0.5).t1);
+// A knock bounced off a locked cell: a red cross in the tunnel between the two cells.
+function crossBetween(ctx, a, b, alpha) {
+  if (alpha <= 0) return;
+  const mx = (a.x + b.x) / 2, my = ROW.y;
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.fillStyle = 'rgba(10,16,44,0.92)'; ctx.beginPath(); ctx.arc(mx, my, 24, 0, TAU); ctx.fill();
+  ctx.strokeStyle = '#ff8a9a'; ctx.lineWidth = 7; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(mx - 11, my - 11); ctx.lineTo(mx + 11, my + 11); ctx.moveTo(mx + 11, my - 11); ctx.lineTo(mx - 11, my + 11); ctx.stroke(); ctx.restore();
+}
+
+function rowScene(ctx, t, A) {
+  if (A <= 0) return;
+  const s = rowStep(t), c = RL.cells;
+  title(ctx, 'Keeping every heartbeat safe', A * env(t, T.c2 + 0.6, T.c3 - 0.1, 0.5));
+  badge(ctx, 'slow motion', 60, 80, A * env(t, T.c3 + 0.1, T.c4 - 0.1, 0.4));
+  title(ctx, "But here's the catch", A * seg(t, T.c4 - 0.1, T.c4 + 0.4));
+  drawRowCells(ctx, t, s, A);
+  const yTop = ROW.y - ROW.h / 2, yBot = ROW.y + ROW.h / 2;
+  // Cue 2: cell 2 knocks both ways; the knock behind hits the cell that just fired.
+  const bw = A * env(t, T.each - 0.1, T.behind + 0.3, 0.3);
+  if (bw > 0) {
+    G.tag(ctx, 'knocks both ways', c[1].x + 60, yTop - 150, { size: 36, alpha: bw });
+    arrow(ctx, c[1].x - 10, yTop - 78, c[0].x + 20, yTop - 78, { alpha: bw, width: 6, head: 24 });
+    arrow(ctx, c[1].x + 10, yTop - 78, c[2].x - 20, yTop - 78, { alpha: bw, width: 6, head: 24 });
+  }
+  G.tag(ctx, 'just fired: still locked', c[0].x + 110, yTop - 80, { size: 34, color: '#ff8a9a', alpha: A * env(t, T.justFired - 0.2, T.ignored - 0.35, 0.3), to: [c[0].x, yTop + 6] });
+  // The first backward knock gets its own cross between the two cells, held while "ignored" is said.
+  crossBetween(ctx, c[0], c[1], A * env(t, T.ignored - 0.3, T.c3 - 0.2, 0.2));
+  G.tag(ctx, 'ignored', c[0].x + 20, yTop - 80, { size: 38, color: '#ffc2cb', alpha: A * env(t, T.ignored - 0.3, T.c3 - 0.2, 0.3) });
+  // Only forwards: an arrow under the row that grows with the wave front.
+  const fa = A * env(t, T.forwards - 0.2, T.c3 + 0.4, 0.4);
+  if (fa > 0) {
+    const front = Math.min(7, Math.max(2, s));
+    const xf = c[0].x + (c[1].x - c[0].x) * front;
+    arrow(ctx, c[0].x, yBot + 70, Math.max(c[1].x, xf), yBot + 70, { alpha: fa, width: 9, head: 34 });
+    text(ctx, 'only forwards', c[0].x - 10, yBot + 140, 42, C.text, 'left', 800, A * env(t, wt(2, 'only go') - 0.15, T.c3 + 0.4, 0.4));
+  }
+  // Cue 3: crossing time against lock time, in real seconds.
+  const PX = 2400, bx = 700;
+  const b1 = A * env(t, T.crosses - 0.3, T.c4 - 0.2, 0.4), b2 = A * env(t, T.stay - 0.3, T.c4 - 0.2, 0.4);
+  if (b1 > 0) {
+    text(ctx, 'wave crosses the heart', bx - 40, 260, 36, C.text, 'right', 700, b1);
+    const g = easeOut(seg(t, T.crosses, T.crosses + 0.7));
+    ctx.save(); ctx.globalAlpha *= b1; ctx.fillStyle = C.spark; ctx.shadowColor = C.spark; ctx.shadowBlur = 16;
+    roundRect(ctx, bx, 244, Math.max(32, 0.1 * PX * g), 32, 16); ctx.fill(); ctx.restore();
+    text(ctx, '0.1 s', bx + 0.1 * PX * g + 24, 261, 36, C.spark, 'left', 800, b1);
+  }
+  if (b2 > 0) {
+    text(ctx, 'cells stay locked', bx - 40, 350, 36, C.text, 'right', 700, b2);
+    const g = easeOut(seg(t, T.stay, T.stay + 0.9));
+    ctx.save(); ctx.globalAlpha *= b2; ctx.fillStyle = G.COL.locked;
+    roundRect(ctx, bx, 334, Math.max(32, 0.25 * PX * g), 32, 16); ctx.fill(); ctx.restore();
+    text(ctx, '0.25 s', bx + 0.25 * PX * g + 24, 351, 36, '#ff8a9a', 'left', 800, b2);
+  }
+  // The last cell's knock back lands on cell 6, still locked: what the long lock protects against.
+  const xb = A * env(t, tBack76 - 0.05, T.c4 - 0.2, 0.2);
+  crossBetween(ctx, c[6], c[7], xb);
+  G.tag(ctx, "still locked: can't come back", (c[6].x + c[7].x) / 2, yBot + 70, { size: 34, color: '#ff8a9a', alpha: A * env(t, tBack76, T.c4 - 0.1, 0.3), to: [(c[6].x + c[7].x) / 2, ROW.y + 26] });
+  G.tag(ctx, 'nothing left', c[7].x - 20, yTop - 80,{ size: 36, alpha: A * env(t, T.nothing - 0.2, T.c4 - 0.1, 0.3) });
+  text(ctx, 'The wave dies', 960, yBot + 120, 52, C.text, 'center', 800, A * env(t, T.dies - 0.1, T.c4 + 0.3, 0.3));
+  // Cue 4: fire order, then fast and slow resetters.
+  const oa = A * env(t, T.differ, T.reset - 0.2, 0.3);
+  text(ctx, 'fires first', c[0].x, yBot + 50, 32, C.dim, 'center', 700, oa);
+  text(ctx, 'fires last', c[7].x, yBot + 50, 32, C.dim, 'center', 700, oa);
+  const ta = A * seg(t, T.reset - 0.2, T.reset + 0.3);
+  for (let i = 0; i < RL.n; i++) {
+    const fast = FAST[i] !== undefined;
+    G.tag(ctx, fast ? 'fast' : 'slow', c[i].x, yTop - 50, { size: 32, color: fast ? '#ffffff' : C.dim, alpha: ta * (fast ? 1 : 0.85) });
+  }
+  G.tag(ctx, "they don't all unlock together", 960, yBot + 110, { size: 42, alpha: A * seg(t, T.together + 0.3, T.together + 0.8) });
+}
+
+// ================================================================ main
+function draw(ctx, t) {
+  const doorA = env(t, -1, T.rule - 0.1, 0.5);
+  title(ctx, 'The lockout', doorA * env(t, -1, T.opens - 0.3, 0.5));
+  badge(ctx, 'slow motion', 60, 80, doorA * seg(t, T.opens - 0.3, T.opens + 0.2));
+  doorPanel(ctx, t, doorA);
+  cellSide(ctx, t, doorA);
+  examples(ctx, t, env(t, T.rule - 0.4, T.c2 + 0.75, 0.4));
+  rowScene(ctx, t, seg(t, T.c2 + 0.6, T.c2 + 1.1));
+  stateKey(ctx, 1590, 36, 1);
+}
+
+window.S06 = { T, sim, W_PTS };
+setup(draw);
+</script>

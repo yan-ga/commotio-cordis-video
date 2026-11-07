@@ -1,0 +1,387 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>s07 window</title>
+<script src="lib.js"></script>
+<script src="shared.js"></script>
+<script src="grid2d.js"></script>
+<script type="importmap">{"imports":{"three":"../node_modules/three/build/three.module.js","three/addons/":"../node_modules/three/examples/jsm/"}}</script>
+<script type="module">
+// Part 7, the vulnerable window. A heart monitor beside the real 3D heart beating in time with it,
+// then one beat: the spike (bottom chambers fire) and the T wave (resetting). A cursor crawls up the
+// T wave while s06's row of fast and slow cells fires at the spike and locks, then the fast cells
+// unlock first into a patchwork. The red window band on the T wave, measured against one heartbeat, then the warning.
+import { loadHeart, createStage, beat } from './heart3d.js';
+const G = window.G2;
+const TAU = Math.PI * 2;
+
+const wt = wordAt;
+const T = {
+  spike: wt(0, 'The tall spike'), firing: wt(0, 'bottom chambers'),
+  bump: wt(0, 'The bump'), twave: wt(0, 'the T wave'),
+  c1: cs(1), partway: wt(1, 'partway'), patch: wt(1, 'patchwork'), unlocked: wt(1, 'unlocked,'),
+  locked: wt(1, 'locked.'), nextTo: wt(1, 'right next'),
+  c2: cs(2), lasts: wt(2, 'It lasts'), hundredths: wt(2, 'a few hundredths'), percent: wt(2, 'about one'), each: wt(2, 'each heartbeat'),
+  c3: cs(3), blow: wt(3, 'a blow'),
+};
+
+// Heart time runs at 60 beats a minute, so one beat is one second and the window (2% of a beat) is 20 ms.
+const WIN0 = 0.47, WIN1 = 0.49, STOP = 0.48;   // the window sits partway up the T wave; the cursor stops inside it
+const P = t => t - 0.3;                        // monitor time in beats during cue 0
+const K = 4;                                   // the beat the monitor zooms into (monitor time 4..5)
+const ZOOM = [4.45, 5.25];
+
+// Cue 1: the cursor sweeps one last beat in slow motion and stops partway up the T wave.
+// Points are [scene time, phase of the beat after K]; it slows before the spike so the cells can be read,
+// then climbs the T wave slowly enough for the fast cells to unlock one at a time.
+const Q_PTS = [[T.c1, P(T.c1) - K - 1], [T.c1 + 0.45, 0.05], [T.c1 + 1.0, 0.16], [T.c1 + 1.5, 0.258], [T.c1 + 2.0, 0.33],
+  [T.partway - 0.1, 0.38], [T.patch - 0.3, 0.468], [T.patch + 0.3, STOP]];
+function qPhase(t) {
+  if (t <= Q_PTS[0][0]) return Q_PTS[0][1];
+  for (let k = 1; k < Q_PTS.length; k++) {
+    const [a, pa] = Q_PTS[k - 1], [b, pb] = Q_PTS[k];
+    if (t <= b) { const u = (t - a) / (b - a); return lerp(pa, pb, k === Q_PTS.length - 1 ? 1 - Math.pow(1 - u, 2) : u); }
+  }
+  return STOP;
+}
+const qTime = ph => { for (let k = 1; k < Q_PTS.length; k++) { const [a, pa] = Q_PTS[k - 1], [b, pb] = Q_PTS[k]; if (ph <= pb) { let lo = a, hi = b; for (let i = 0; i < 30; i++) { const m = (lo + hi) / 2; if (qPhase(m) < ph) lo = m; else hi = m; } return hi; } } return Q_PTS[Q_PTS.length - 1][0]; };
+
+// Cursor position as an absolute monitor phase, and whether it is still sweeping live.
+function cursorPhase(t) {
+  if (t < T.c1) {
+    const p = P(t);
+    if (t < ZOOM[0]) return p;
+    return K + (p - Math.floor(p));
+  }
+  return K + 1 + qPhase(t);
+}
+
+// ================================================================ monitor panel (same look as s08's ECG)
+const LO = -0.5, HI = 1.45;
+function monitor(ctx, box, p0, span, o) {
+  const { x, y, w, h } = box;
+  const alpha = o.alpha ?? 1;
+  const px = x + 22, pw = w - 44, py = y + 66, ph = y + h - 22 - py;
+  const X = p => px + (p - p0) / span * pw, Y = v => py + ph * (HI - v) / (HI - LO);
+  const api = { X, Y, px, pw, py, ph };
+  if (alpha <= 0) return api;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.fillStyle = 'rgba(2,14,10,0.92)'; roundRect(ctx, x, y, w, h, 22); ctx.fill();
+  ctx.strokeStyle = 'rgba(92,240,143,0.25)'; ctx.lineWidth = 2; ctx.stroke();
+  text(ctx, 'ECG', x + 28, y + 36, 32, '#8fe8b0', 'left', 800);
+  text(ctx, 'heart monitor', x + 104, y + 37, 30, 'rgba(143,232,176,0.7)', 'left', 600);
+  ctx.save(); ctx.beginPath(); ctx.rect(px, py, pw, ph); ctx.clip();
+  // Grid: small squares every 0.04 s, big every 0.2 s.
+  for (const [stepT, a] of [[0.04, 0.05], [0.2, 0.12]]) {
+    const dx = stepT / span * pw;
+    if (dx < 7) continue;
+    ctx.strokeStyle = `rgba(92,240,143,${a})`; ctx.lineWidth = stepT > 0.1 ? 1.5 : 1;
+    ctx.beginPath();
+    const g0 = Math.ceil(p0 / stepT) * stepT;
+    for (let p = g0; p <= p0 + span + 1e-6; p += stepT) { ctx.moveTo(X(p), py); ctx.lineTo(X(p), py + ph); }
+    for (let gy = Y(0); gy <= py + ph; gy += dx) { ctx.moveTo(px, gy); ctx.lineTo(px + pw, gy); }
+    for (let gy = Y(0) - dx; gy >= py; gy -= dx) { ctx.moveTo(px, gy); ctx.lineTo(px + pw, gy); }
+    ctx.stroke();
+  }
+  if (o.band) o.band(api);
+  // Trace: bright up to the cursor, dimmer ahead of it (o.ahead), with the sweep's erase gap (o.gap).
+  const N = Math.round(pw / 2), cur = o.cursor;
+  const seg_ = (from, to, a, width) => {
+    if (to <= from || a <= 0) return;
+    ctx.save(); ctx.globalAlpha *= a;
+    ctx.strokeStyle = C.ecg; ctx.lineWidth = width; ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.shadowColor = C.ecg; ctx.shadowBlur = 14;
+    ctx.beginPath();
+    const n = Math.max(2, Math.ceil(N * (to - from) / span));
+    for (let i = 0; i <= n; i++) { const p = from + (to - from) * i / n; i ? ctx.lineTo(X(p), Y(ecgValue(p))) : ctx.moveTo(X(p), Y(ecgValue(p))); }
+    ctx.stroke(); ctx.restore();
+  };
+  const end = p0 + span;
+  if (cur == null) seg_(p0, end, 1, 5);
+  else {
+    const gap = o.gap ? 0.045 * span : 0;
+    seg_(p0, Math.min(cur, end), 1, 5);
+    seg_(Math.min(cur + gap, end), end, o.ahead ?? 1, 5);
+  }
+  for (const hl of o.highlights || []) if (hl.a > 0) {
+    // A highlighted part of the beat: the same trace, thicker, with a soft white halo.
+    ctx.save(); ctx.globalAlpha *= hl.a; ctx.strokeStyle = 'rgba(220,255,230,0.9)'; ctx.lineWidth = 9; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.shadowColor = '#bfffd2'; ctx.shadowBlur = 26;
+    ctx.beginPath();
+    for (let i = 0; i <= 80; i++) { const p = hl.from + (hl.to - hl.from) * i / 80; i ? ctx.lineTo(X(p), Y(ecgValue(p))) : ctx.moveTo(X(p), Y(ecgValue(p))); }
+    ctx.stroke(); ctx.restore();
+  }
+  if (cur != null && (o.cursorAlpha ?? 1) > 0) {
+    const ca = o.cursorAlpha ?? 1, cx = X(cur), cy = Y(ecgValue(cur));
+    if (o.cursorLine) {
+      ctx.save(); ctx.globalAlpha *= ca * o.cursorLine; ctx.strokeStyle = 'rgba(234,255,240,0.75)'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(cx, py); ctx.lineTo(cx, py + ph); ctx.stroke(); ctx.restore();
+    }
+    glow(ctx, cx, cy, 34, C.ecg, 0.9 * ca);
+    ctx.save(); ctx.globalAlpha *= ca; ctx.fillStyle = '#eafff0'; ctx.beginPath(); ctx.arc(cx, cy, 9, 0, TAU); ctx.fill(); ctx.restore();
+  }
+  ctx.restore();
+  if (o.badge > 0) {
+    ctx.save(); ctx.globalAlpha *= o.badge;
+    ctx.font = `700 30px ${FONT}`;
+    const bw = ctx.measureText('slow motion').width + 70, bx = x + w - bw - 22, by = y + 10;
+    ctx.fillStyle = 'rgba(5,10,30,0.7)'; roundRect(ctx, bx, by, bw, 52, 26); ctx.fill();
+    ctx.fillStyle = '#ff6b6b'; ctx.beginPath(); ctx.arc(bx + 30, by + 26, 9, 0, TAU); ctx.fill();
+    ctx.restore();
+    text(ctx, 'slow motion', x + w - bw - 22 + 50, y + 37, 30, C.text, 'left', 700, alpha * o.badge);
+  }
+  ctx.restore();
+  return api;
+}
+
+// ================================================================ colour key (three states only, as in s08)
+function stateKey(ctx, x, y, alpha) {
+  if (alpha <= 0) return;
+  const items = [['Ready', 'unlocked'], ['Locked', 'locked'], ['Firing', 'firing']];
+  const w = 290, rowH = 58, h = items.length * rowH + 24;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  ctx.fillStyle = 'rgba(5,10,30,0.66)'; roundRect(ctx, x, y, w, h, 18); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth = 2; ctx.stroke();
+  items.forEach(([label, st], k) => {
+    const cy = y + 12 + rowH * (k + 0.5);
+    if (st === 'firing') glow(ctx, x + 62, cy, 50, C.spark, 0.6);
+    G.brick(ctx, x + 62, cy, 76, 44, st, { lockScale: 1.05 });
+    text(ctx, label, x + 120, cy + 1, 32, C.text, 'left', 700);
+  });
+  ctx.restore();
+}
+
+// ================================================================ the cell row
+// The same 8 cells, fast and slow, as the end of s06. All fire at the spike (a quick sweep left to right)
+// and the whole row locks. Then the fast cells 6, 3, 1 unlock in that order as the cursor climbs the
+// T wave, while the slow cells are still locked where the cursor stops.
+const ROW = { n: 8, w: 160, h: 112, gap: 30, y: 660 };
+const FAST = [1, 3, 6];
+const UNLOCK = [null, 0.46, null, 0.435, null, null, 0.41, null];
+const PAIR = [3, 4];          // ready next to locked, for the bracket
+const FLIP = 0.32;            // seconds for a cell to flip from red to blue
+const FIRE_LEN = 0.55;
+function rowCells(cx) {
+  const total = ROW.n * ROW.w + (ROW.n - 1) * ROW.gap, x0 = cx - total / 2 + ROW.w / 2;
+  return Array.from({ length: ROW.n }, (_, i) => ({ x: x0 + i * (ROW.w + ROW.gap), y: ROW.y, w: ROW.w, h: ROW.h }));
+}
+const tFire = i => qTime(0.258) + 0.05 * i;
+const tUnlock = i => (UNLOCK[i] == null ? Infinity : qTime(UNLOCK[i]));
+
+function drawRow(ctx, t, cells, alpha) {
+  if (alpha <= 0) return;
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.lineCap = 'round';
+  for (let i = 0; i < cells.length - 1; i++) {
+    const a = cells[i], b = cells[i + 1];
+    ctx.strokeStyle = 'rgba(190,205,240,0.55)'; ctx.lineWidth = a.h * 0.26;
+    ctx.beginPath(); ctx.moveTo(a.x + a.w / 2 - 4, a.y); ctx.lineTo(b.x - b.w / 2 + 4, b.y); ctx.stroke();
+    ctx.strokeStyle = 'rgba(15,25,60,0.85)'; ctx.lineWidth = a.h * 0.11;
+    ctx.beginPath(); ctx.moveTo(a.x + a.w / 2 - 4, a.y); ctx.lineTo(b.x - b.w / 2 + 4, b.y); ctx.stroke();
+  }
+  ctx.restore();
+  // Each group's outline is held while the voice names it, the locked one until the window comes in.
+  const unlockedHl = env(t, T.unlocked - 0.15, T.nextTo + 0.1, 0.2), lockedHl = env(t, T.locked - 0.15, T.c2 - 0.3, 0.2);
+  cells.forEach((c, i) => {
+    const tf = tFire(i), tu = tUnlock(i);
+    const fireOn = t >= tf && t < tf + FIRE_LEN;
+    const halo = t >= tf ? (t < tf + 0.06 ? (t - tf) / 0.06 : 1 - seg(t, tf + FIRE_LEN - 0.1, tf + FIRE_LEN + 0.45)) : 0;
+    if (halo > 0) glow(ctx, c.x, c.y, 150, C.spark, 0.85 * halo * alpha);
+    // Red to blue as a card flip, so the brick never passes through a blended in-between colour.
+    const fp = seg(t, tu, tu + FLIP);
+    let name = t < tf ? 'unlocked' : fireOn ? 'firing' : fp >= 0.5 ? 'unlocked' : 'locked';
+    const sx = fp > 0 && fp < 1 ? Math.max(0.04, Math.abs(Math.cos(Math.PI * fp))) : 1;
+    const ready = name === 'unlocked' && t >= tf;
+    const pulse = ready ? unlockedHl : name === 'locked' ? lockedHl : 0;
+    const st = { ...{ unlocked: { level: 0, open: 1, fire: 0 }, locked: { level: 1, open: 0, fire: 0 }, firing: { level: 1, open: 0, fire: 1 } }[name], pulse };
+    if (fp > 0.5 && fp < 1.6) glow(ctx, c.x, c.y, 120, '#5fd3f0', 0.5 * (1 - seg(fp, 0.5, 1)) * alpha);
+    ctx.save(); ctx.translate(c.x, c.y); ctx.scale(sx, 1);
+    G.brick(ctx, 0, 0, c.w, c.h, st, { alpha, lockScale: 1.1 });
+    ctx.restore();
+  });
+}
+
+function bracket(ctx, a, b, y, alpha) {
+  if (alpha <= 0) return;
+  const x0 = a.x - a.w / 2 + 6, x1 = b.x + b.w / 2 - 6;
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 5; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.shadowColor = 'rgba(255,255,255,0.5)'; ctx.shadowBlur = 10;
+  ctx.beginPath(); ctx.moveTo(x0, y - 16); ctx.lineTo(x0, y); ctx.lineTo(x1, y); ctx.lineTo(x1, y - 16);
+  ctx.moveTo((x0 + x1) / 2, y); ctx.lineTo((x0 + x1) / 2, y + 16); ctx.stroke();
+  ctx.restore();
+}
+
+function impactRings(ctx, x, y, r, t, t0, alpha = 1) {
+  for (let k = 0; k < 3; k++) {
+    const p = seg(t, t0 + k * 0.18, t0 + k * 0.18 + 0.9);
+    if (p <= 0 || p >= 1) continue;
+    ctx.save(); ctx.globalAlpha = alpha * (1 - p); ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 7 * (1 - p) + 2;
+    ctx.beginPath(); ctx.arc(x, y, r * (0.4 + 1.0 * easeOut(p)), 0, TAU); ctx.stroke(); ctx.restore();
+  }
+}
+
+function warning(ctx, x, y, s, alpha, pop) {
+  if (alpha <= 0) return;
+  const k = pop >= 1 ? 1 : 1.35 - 0.35 * easeOut(pop);
+  ctx.save(); ctx.globalAlpha *= alpha * clamp(pop * 3); ctx.translate(x, y); ctx.scale(k * s, k * s);
+  glow(ctx, 0, 6, 120, '#ff4d64', 0.45);
+  ctx.fillStyle = '#ff4d64'; ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 6; ctx.lineJoin = 'round';
+  ctx.beginPath(); ctx.moveTo(0, -58); ctx.lineTo(62, 48); ctx.lineTo(-62, 48); ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#ffffff';
+  roundRect(ctx, -7, -26, 14, 46, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(0, 34, 8, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+
+// ================================================================ 3D heart beside the monitor (cue 0)
+const hStage = createStage();
+const heart = await loadHeart(hStage.renderer);
+hStage.scene.add(heart.group);
+// Looking left of the heart puts it on the right of the frame, beside the monitor.
+const HEART_TARGET = new heart.group.position.constructor(-2.05, -0.08, 0);
+// ECG phase to heart3d's WAVE timeline: atria during the P wave, the ventricle sweep across the spike
+// (stretched a little past the real 0.1 s so it can be seen), then the afterglow.
+const WAVE_MAP = [[0.06, 0], [0.18, 0.32], [0.225, 0.52], [0.34, 0.82], [0.5, 1]];
+function waveAt(ecgPh) {
+  const f = ((ecgPh % 1) + 1) % 1;
+  if (f < WAVE_MAP[0][0] || f > WAVE_MAP[WAVE_MAP.length - 1][0]) return null;
+  for (let k = 1; k < WAVE_MAP.length; k++) {
+    const [a, wa] = WAVE_MAP[k - 1], [b, wb] = WAVE_MAP[k];
+    if (f <= b) return lerp(wa, wb, (f - a) / (b - a));
+  }
+  return null;
+}
+
+// ================================================================ layout
+const B0 = { x: 110, y: 250, w: 1120, h: 560 };     // cue 0: monitor on the left, heart on the right
+const B1 = { x: 100, y: 46, w: 1440, h: 420 };      // cue 1: monitor on top, room below, key at top right
+const B2 = { ...B1, x: (W - B1.w) / 2 };            // cues 2 and 3: the key has gone, so everything centres
+const mixBox = (a, b, p) => ({ x: lerp(a.x, b.x, p), y: lerp(a.y, b.y, p), w: lerp(a.w, b.w, p), h: lerp(a.h, b.h, p) });
+
+function draw(ctx, t) {
+  // ---- the 3D heart, beating in time with the trace (ventricles squeeze just after the spike)
+  const ha = env(t, 0.3, T.c1 + 0.7, 0.6);
+  if (ha > 0) {
+    const ecgPh = cursorPhase(Math.min(t, T.c1)), ph = ecgPh - 0.1;
+    // From "the tall spike" on, the electrical wave crosses the heart in step with each trace.
+    const wave = t > T.spike - 0.4 && t < T.c1 ? waveAt(ecgPh) : null;
+    heart.update({ t, ...beat(((ph % 1) + 1) % 1), wave });
+    hStage.orbit(-12 + t * 1.2, 4, 6.3, HEART_TARGET);
+    hStage.render(t);
+    ctx.save(); ctx.globalAlpha = ha; ctx.drawImage(hStage.canvas, 0, 0); ctx.restore();
+  }
+
+  // ---- monitor
+  const mv = easeIO(seg(t, T.c1, T.c1 + 0.9));
+  const box = mixBox(mixBox(B0, B1, mv), B2, easeIO(seg(t, T.c2, T.c2 + 0.9)));
+  // View: three beats live, zooming into one beat (K) for everything after.
+  const z = easeIO(seg(t, ZOOM[0], ZOOM[1]));
+  const base = Math.floor(P(Math.min(t, ZOOM[0])) / 3) * 3;
+  let p0 = lerp(base, K, z), span = lerp(3, 1, z);
+  if (t >= T.c1) { p0 = K + 1; span = 1; }
+  // Cue 1 swaps the frozen beat K for the next beat K + 1 (identical trace) while the cursor is on the flat start.
+  const cur = cursorPhase(t);
+  const live = t < T.c1;
+  const ahead = t < T.c1 ? 1 : lerp(1, 0.3, seg(t, T.c1 + 0.2, T.c1 + 0.6)) + 0.7 * seg(t, T.c2 - 0.2, T.c2 + 0.4);
+  const bandA = seg(t, T.c2 - 0.1, T.c2 + 0.5);
+  const dangerPulse = t > T.blow ? 0.5 + 0.5 * Math.sin((t - T.blow) * 5) : 0;
+  const M = monitor(ctx, box, p0, span, {
+    alpha: env(t, 0.4, 999, 0.6), cursor: cur, gap: live, ahead,
+    cursorLine: t >= T.c1 ? env(t, T.c1 + 0.4, T.c2 + 0.2, 0.4) : 0,
+    badge: env(t, T.c1 + 0.6, T.partway + 1.0, 0.4),
+    highlights: [
+      { from: K + 0.225, to: K + 0.29, a: env(t, T.spike - 0.1, T.c1 - 0.1, 0.35) },
+      { from: K + 0.38, to: K + 0.66, a: env(t, T.bump - 0.1, T.c1 - 0.1, 0.35) },
+    ],
+    band: api => {
+      if (bandA <= 0) return;
+      const x0 = api.X(K + 1 + WIN0), x1 = api.X(K + 1 + WIN1), grow = easeOut(bandA);
+      const mid = api.Y(ecgValue(STOP)), top = lerp(mid, api.py, grow), bot = lerp(mid, api.py + api.ph, grow);
+      ctx.save(); ctx.globalAlpha *= bandA;
+      glow(ctx, (x0 + x1) / 2, mid, 160, '#ff4d64', 0.22 + 0.25 * dangerPulse);
+      ctx.fillStyle = `rgba(255,77,100,${0.5 + 0.2 * dangerPulse})`; ctx.fillRect(x0, top, x1 - x0, bot - top);
+      ctx.strokeStyle = '#ff8a9a'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(x0, top); ctx.lineTo(x0, bot); ctx.moveTo(x1, top); ctx.lineTo(x1, bot); ctx.stroke();
+      ctx.restore();
+    },
+  });
+
+  // ---- cue 0 labels on the beat
+  const spikeX = M.X(K + 0.258), spikeY = M.Y(ecgValue(K + 0.258));
+  G.tag(ctx, 'bottom chambers fire', spikeX + 240, spikeY + 20, { size: 34, alpha: env(t, T.firing - 0.15, T.c1 - 0.1, 0.35), to: [spikeX + 8, spikeY + 6] });
+  const tX = M.X(K + 0.52), tY = M.Y(ecgValue(K + 0.52));
+  G.tag(ctx, 'T wave: resetting', tX + 200, tY - 95, { size: 34, alpha: env(t, T.twave - 0.1, T.c1 - 0.1, 0.35), to: [tX + 6, tY - 14] });
+
+  // ---- cue 1: the cell row under the cursor
+  // The patchwork stays under the band while the voice names it, then gives way to the heartbeat bar.
+  const cells = rowCells(box.x + box.w / 2);
+  const rowA = env(t, T.c1 + 0.5, T.lasts - 0.1, 0.4);
+  if (rowA > 0) {
+    // Dashed drop line: the cells show the heart muscle at the cursor's moment.
+    const cx = M.X(cur), la = rowA * seg(t, T.c1 + 0.6, T.c1 + 1.0);
+    ctx.save(); ctx.globalAlpha *= la * 0.8; ctx.strokeStyle = 'rgba(234,255,240,0.8)'; ctx.lineWidth = 3; ctx.setLineDash([10, 12]);
+    ctx.beginPath(); ctx.moveTo(cx, box.y + box.h + 6); ctx.lineTo(cx, ROW.y - ROW.h / 2 - 84); ctx.stroke(); ctx.restore();
+    drawRow(ctx, t, cells, rowA);
+    cells.forEach((c, i) => {
+      const fast = FAST.includes(i);
+      G.tag(ctx, fast ? 'fast' : 'slow', c.x, c.y - c.h / 2 - 46, { size: 32, color: fast ? '#ffffff' : C.dim, alpha: rowA * (fast ? 1 : 0.85) });
+    });
+  }
+  G.tag(ctx, 'patchwork', box.x + box.w / 2, 800, { size: 44, alpha: env(t, T.patch - 0.15, T.nextTo - 0.15, 0.3) });
+  const ba = env(t, T.nextTo - 0.1, T.c2 + 0.1, 0.3);
+  bracket(ctx, cells[PAIR[0]], cells[PAIR[1]], ROW.y + ROW.h / 2 + 30, ba);
+  G.tag(ctx, 'right next to each other', (cells[PAIR[0]].x + cells[PAIR[1]].x) / 2, ROW.y + ROW.h / 2 + 96, { size: 38, alpha: ba });
+  stateKey(ctx, 1600, 46, env(t, T.c1 + 0.6, T.c2 + 0.2, 0.5));
+
+  // ---- cue 2: the window, measured against one heartbeat
+  const midX = (M.X(K + 1 + WIN0) + M.X(K + 1 + WIN1)) / 2;
+  const vwA = env(t, T.c2 + 0.2, 999, 0.4);
+  if (vwA > 0) {
+    text(ctx, 'VULNERABLE WINDOW', M.X(K + 1 + WIN1) + 28, M.py + 38, 46, '#ff6b7d', 'left', 800, vwA);
+  }
+  const barA = env(t, T.lasts - 0.1, T.c3, 0.4);
+  if (barA > 0) {
+    const bx0 = M.X(K + 1), bx1 = M.X(K + 2), by = 690, bh = 46;
+    const sx0 = M.X(K + 1 + WIN0), sx1 = M.X(K + 1 + WIN1);
+    // Guides from the band down to its slice of the bar.
+    ctx.save(); ctx.globalAlpha *= barA * 0.7; ctx.strokeStyle = '#ff8a9a'; ctx.lineWidth = 2.5; ctx.setLineDash([8, 10]);
+    ctx.beginPath(); ctx.moveTo(sx0, box.y + box.h + 6); ctx.lineTo(sx0, by - 8); ctx.moveTo(sx1, box.y + box.h + 6); ctx.lineTo(sx1, by - 8); ctx.stroke(); ctx.restore();
+    // One heartbeat as a bar; a playhead runs across it in one real second.
+    const run = seg(t, T.lasts + 0.35, T.lasts + 1.35);
+    ctx.save(); ctx.globalAlpha *= barA;
+    ctx.fillStyle = 'rgba(255,255,255,0.08)'; roundRect(ctx, bx0, by, bx1 - bx0, bh, bh / 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.lineWidth = 2; ctx.stroke();
+    if (run > 0) {
+      ctx.save(); roundRect(ctx, bx0, by, bx1 - bx0, bh, bh / 2); ctx.clip();
+      ctx.fillStyle = 'rgba(160,200,255,0.28)'; ctx.fillRect(bx0, by, (bx1 - bx0) * run, bh); ctx.restore();
+    }
+    // The window's slice lights up as the playhead reaches it and stays lit.
+    const sl = seg(run, WIN0, WIN1);
+    if (sl > 0) {
+      glow(ctx, (sx0 + sx1) / 2, by + bh / 2, 70, '#ff4d64', 0.6 * sl);
+      ctx.fillStyle = '#ff4d64'; ctx.fillRect(sx0, by - 6, (sx1 - sx0) * sl, bh + 12);
+    }
+    if (run > 0 && run < 1) {
+      const hx = lerp(bx0, bx1, run);
+      ctx.fillStyle = '#ffffff'; ctx.fillRect(hx - 2, by - 10, 4, bh + 20);
+    }
+    ctx.restore();
+    text(ctx, '0', bx0 + 4, by + bh + 34, 30, C.dim, 'left', 700, barA);
+    text(ctx, '1 second', bx1 - 4, by + bh + 34, 30, C.dim, 'right', 700, barA);
+    text(ctx, 'one heartbeat', bx0 + 4, by - 36, 34, C.text, 'left', 700, barA * seg(t, T.each - 0.3, T.each + 0.1));
+    G.tag(ctx, 'a few hundredths of a second', midX, 808, { size: 38, color: '#ffc2cb', alpha: barA * seg(t, T.hundredths - 0.1, T.hundredths + 0.3) });
+    G.tag(ctx, 'about 1 to 2% of each heartbeat', midX, 892, { size: 38, alpha: barA * seg(t, T.percent - 0.1, T.percent + 0.3) });
+  }
+
+  // ---- cue 3: a blow here is dangerous
+  const ca = env(t, T.c3, 999, 0.4);
+  if (ca > 0) {
+    const cy = M.Y(ecgValue(K + 1 + STOP));
+    impactRings(ctx, M.X(K + 1 + STOP), cy, 70, t, T.blow, ca);
+    ctx.save(); ctx.globalAlpha *= ca * 0.7; ctx.strokeStyle = '#ff8a9a'; ctx.lineWidth = 3; ctx.setLineDash([8, 10]);
+    ctx.beginPath(); ctx.moveTo(midX, box.y + box.h + 6); ctx.lineTo(midX, 555); ctx.stroke(); ctx.restore();
+    warning(ctx, midX, 650, 1.5, ca, seg(t, T.c3, T.c3 + 0.4));
+    G.tag(ctx, 'a blow here = danger', midX, 830, { size: 52, color: '#ffffff', borderColor: '#ff6b7d', alpha: ca * seg(t, T.blow - 0.2, T.blow + 0.2) });
+  }
+}
+
+window.S07 = { T, qTime, tFire, tUnlock };
+setup(draw);
+</script>
